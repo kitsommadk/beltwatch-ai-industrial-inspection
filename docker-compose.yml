@@ -1,0 +1,24 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      BELTWATCH_ALLOWED_ORIGINS: http://localhost:5173
+      BELTWATCH_DB_PATH: /data/beltwatch.db
+    volumes:
+      - beltwatch-data:/data
+    ports:
+      - "8000:8000"
+
+  console:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://localhost:8000/api
+    depends_on:
+      - api
+    ports:
+      - "5173:80"
+
+volumes:
+  beltwatch-data:
+
