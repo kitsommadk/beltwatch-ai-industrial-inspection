@@ -24,6 +24,10 @@ export const api = {
     method: "POST",
     body: JSON.stringify({ camera, measured_span_px }),
   }),
+  captureAuto: (camera) => request("/evidence/capture-auto", {
+    method: "POST",
+    body: JSON.stringify({ camera }),
+  }),
   start: (data) => request("/session/start", { method: "POST", body: JSON.stringify(data) }),
   pause: () => request("/session/pause", { method: "POST" }),
   progress: (delta_ft = 12) => request("/session/progress", { method: "POST", body: JSON.stringify({ delta_ft }) }),
