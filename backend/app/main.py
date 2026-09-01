@@ -77,8 +77,12 @@ def progress_session(payload:ProgressInput):
         s=current_session(con)
         if s is None:raise HTTPException(404,"No inspection session exists")
         if s["status"]!="inspecting":return _session_response(con,s)
-        footage=min(s["target_length_ft"],s["footage_ft"]+payload.delta_ft); status="complete" if footage>=s["target_length_ft"] else "inspecting"; width=round(s["target_width_in"]+uniform(-.035,.035),3)
-        con.execute("UPDATE sessions SET footage_ft=?,current_width_in=?,status=?,updated_at=? WHERE id=?",(footage,width,status,now(),s["id"]));
+        footage=min(s["target_length_ft"],s["footage_ft"]+payload.delta_ft); status="complete" if footage>=s["target_length_ft"] else "inspecting"
+        if s["run_layout"]=="single":
+            width=round(s["target_width_in"]+uniform(-.035,.035),3)
+            con.execute("UPDATE sessions SET footage_ft=?,current_width_in=?,status=?,updated_at=? WHERE id=?",(footage,width,status,now(),s["id"]))
+        else:
+            con.execute("UPDATE sessions SET footage_ft=?,status=?,updated_at=? WHERE id=?",(footage,status,now(),s["id"]))
         if status=="complete":audit(con,"session.complete",f"session={s['id']} footage={footage}")
         return _session_response(con,current_session(con))
 
@@ -111,13 +115,12 @@ def capture_evidence_auto(payload:EvidenceAutoCaptureRequest,runtime:InspectionR
     try:
         if ctx["run_layout"]=="single":
             service=runtime.service_for(payload.camera); estimator=runtime.estimator_for(payload.camera); evidence=service.capture_width_auto(estimator=estimator,target_width_in=ctx["target_width_in"],warning_tolerance_in=ctx["tolerance_in"],fail_tolerance_in=ctx["tolerance_in"]*2)
-            return {"run_layout":"single","records":[_persist_captured_evidence(ctx["session_id"],evidence,lane_id="belt")]}
+            return _persist_captured_evidence(ctx["session_id"],evidence,lane_id="belt")
         if set(ctx["lane_targets"])!={"belt-a","belt-b"}:raise RuntimeConfigurationError("slit-two-lane session is missing exact belt-a/b targets")
         service=runtime.two_lane_service_for(payload.camera); estimator=runtime.two_lane_estimator_for(payload.camera)
         lanes=capture_two_lane_width_auto(service,estimator,ctx["lane_targets"],ctx["tolerance_in"],ctx["tolerance_in"]*2)
         saved=[_persist_captured_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in lanes]
-        if saved:
-            with connect() as con: con.execute("UPDATE sessions SET current_width_in=?,updated_at=? WHERE id=?",(saved[0]["measured_width_in"],now(),ctx["session_id"])); audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b")
+        with connect() as con: audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b")
         return {"run_layout":"slit-two-lane","shared_frame_sequence":saved[0]["frame_sequence"],"shared_position_ft":saved[0]["position_ft"],"records":saved}
     except (RuntimeConfigurationError,ValueError,RuntimeError,EOFError) as exc:raise HTTPException(422,str(exc)) from exc
 
@@ -149,6 +152,7 @@ def simulate_event(payload:DetectionRequest):
     with connect() as con:
         s=current_session(con)
         if s is None:raise HTTPException(409,"Start an inspection session before creating events")
+        if s["run_layout"]!="single":raise HTTPException(409,"simulated width events are only available for single-belt sessions until lane-aware event simulation is implemented")
         d=detector.detect(payload.kind,s["target_width_in"],payload.camera); location=min(s["target_length_ft"],s["footage_ft"]+round(uniform(1,18),1)); cursor=con.execute("INSERT INTO events(session_id,created_at,damage_type,severity,camera,location_ft,measured_width_in,confidence,status) VALUES (?,?,?,?,?,?,?,?,'open')",(s["id"],now(),d.damage_type,d.severity,d.camera,location,d.measured_width_in,d.confidence)); event=con.execute("SELECT * FROM events WHERE id=?",(cursor.lastrowid,)).fetchone(); audit(con,"event.created",f"event={event['id']} type={event['damage_type']}"); return row_dict(event)
 
 @app.post("/api/events/{event_id}/review")
