@@ -12,6 +12,7 @@ from .calibration import SimulatedPositionProvider, make_calibration_profile
 from .camera import SimulatedCamera
 from .edge_span import MultiRowDarkEstimator, SpanEstimator
 from .evidence import EvidenceService
+from .geometry_quality import GeometryQualityPolicy
 from .replay import ReplayCamera, ReplayFrame
 
 
@@ -110,8 +111,16 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
                 min_run_px=100,
                 max_span_spread_px=12,
             )
-            # Stable evidence provenance label for this configured algorithm contract.
+            # Stable evidence provenance and quality policy for this configured
+            # algorithm contract. These are software-validation thresholds only.
             estimator.provenance_id = "multirow-dark-v1"
+            estimator.quality_policy = GeometryQualityPolicy(
+                policy_id="replay-multirow-quality-v1",
+                high_confidence_min_rows=5,
+                valid_min_rows=3,
+                high_confidence_max_span_spread_px=2,
+                valid_max_span_spread_px=12,
+            )
             estimators[camera_id] = estimator
         services[camera_id] = EvidenceService(camera, position, calibration)
 
