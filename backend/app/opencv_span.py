@@ -17,8 +17,10 @@ class OpenCVContourEstimator:
     """Estimate belt edges from the largest dark connected contour.
 
     The estimator thresholds a grayscale image, performs a small morphological
-    closing operation, finds external contours, and returns the bounding interval
-    of the largest contour that meets minimum area/height requirements.
+    closing operation, finds external contours, and identifies the largest
+    belt-like region. Final left/right edges use vertical foreground coverage
+    rather than the raw contour bounding box so isolated connected noise pixels do
+    not expand the measured belt span.
     """
 
     def __init__(
@@ -28,6 +30,7 @@ class OpenCVContourEstimator:
         min_area_px: float = 2_000.0,
         min_height_fraction: float = 0.25,
         close_kernel_px: int = 5,
+        min_column_coverage_fraction: float = 0.20,
         cv2_module: Any | None = None,
     ) -> None:
         if not 0 <= threshold <= 255:
@@ -38,11 +41,14 @@ class OpenCVContourEstimator:
             raise ValueError("min_height_fraction must be within (0, 1]")
         if close_kernel_px <= 0:
             raise ValueError("close_kernel_px must be greater than zero")
+        if not 0 < min_column_coverage_fraction <= 1:
+            raise ValueError("min_column_coverage_fraction must be within (0, 1]")
 
         self.threshold = float(threshold)
         self.min_area_px = float(min_area_px)
         self.min_height_fraction = float(min_height_fraction)
         self.close_kernel_px = int(close_kernel_px)
+        self.min_column_coverage_fraction = float(min_column_coverage_fraction)
         self._cv2 = cv2_module
 
     def _cv(self):
@@ -86,26 +92,43 @@ class OpenCVContourEstimator:
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        candidates: list[tuple[float, int, int, int, int]] = []
+        candidates: list[tuple[float, Any, int, int, int, int]] = []
         min_height_px = height * self.min_height_fraction
         for contour in contours:
             area = float(cv2.contourArea(contour))
             x, y, w, h = cv2.boundingRect(contour)
             if area >= self.min_area_px and h >= min_height_px and w > 0:
-                candidates.append((area, x, y, w, h))
+                candidates.append((area, contour, x, y, w, h))
 
         if not candidates:
             raise ValueError("no belt-like contour found")
 
-        _, x, y, w, h = max(candidates, key=lambda item: item[0])
-        right = x + w
+        _, contour, x, y, w, h = max(candidates, key=lambda item: item[0])
+
+        # The raw contour bounding box can be expanded by a few isolated dark
+        # pixels that become connected during morphological closing. Build a mask
+        # for the selected contour and require a column to contain foreground over
+        # a meaningful fraction of the contour height before treating it as belt.
+        contour_mask = binary * 0
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
+        roi = contour_mask[y : y + h, x : x + w]
+        required_rows = max(1, int(round(h * self.min_column_coverage_fraction)))
+        column_counts = (roi > 0).sum(axis=0)
+        valid_columns = [index for index, count in enumerate(column_counts) if count >= required_rows]
+        if not valid_columns:
+            raise ValueError("belt contour has no columns with sufficient vertical coverage")
+
+        left = x + valid_columns[0]
+        right = x + valid_columns[-1] + 1
+        if right <= left:
+            raise ValueError("estimated contour span is invalid")
         if right > frame.width_px:
             raise ValueError("estimated span exceeds declared frame width")
 
         return BeltSpan(
-            left_x=int(x),
+            left_x=int(left),
             right_x_exclusive=int(right),
-            span_px=int(w),
+            span_px=int(right - left),
             row_y=int(y + h // 2),
             threshold=self.threshold,
             sampled_rows=int(h),
