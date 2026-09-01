@@ -6,7 +6,7 @@ from .database import connect
 from .evidence import InspectionEvidence
 
 
-EVIDENCE_SCHEMA_VERSION = 6
+EVIDENCE_SCHEMA_VERSION = 7
 
 
 def _geometry_columns(con) -> set[str]:
@@ -45,6 +45,10 @@ def _migrate_v5_to_v6(con) -> None:
     if "min_edge_sharpness" not in columns:
         con.execute("ALTER TABLE inspection_geometry ADD COLUMN min_edge_sharpness REAL")
     con.execute("UPDATE evidence_schema_metadata SET schema_version=6 WHERE singleton_id=1")
+
+
+def _migrate_v6_to_v7(con) -> None:
+    con.execute("UPDATE evidence_schema_metadata SET schema_version=7 WHERE singleton_id=1")
 
 
 def initialize_evidence_store() -> None:
@@ -95,6 +99,24 @@ def initialize_evidence_store() -> None:
                 CHECK(sampled_rows > 0),
                 CHECK(span_spread_px >= 0)
             );
+            CREATE TABLE IF NOT EXISTS inspection_frame_quality (
+                evidence_id INTEGER PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                sampled_pixels INTEGER NOT NULL,
+                mean_intensity REAL NOT NULL,
+                p05_intensity REAL NOT NULL,
+                p95_intensity REAL NOT NULL,
+                dynamic_range REAL NOT NULL,
+                low_clipped_fraction REAL NOT NULL,
+                high_clipped_fraction REAL NOT NULL,
+                reasons_json TEXT NOT NULL,
+                FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE,
+                CHECK(sampled_pixels > 0),
+                CHECK(dynamic_range >= 0),
+                CHECK(low_clipped_fraction >= 0 AND low_clipped_fraction <= 1),
+                CHECK(high_clipped_fraction >= 0 AND high_clipped_fraction <= 1)
+            );
             CREATE INDEX IF NOT EXISTS idx_evidence_session_position ON inspection_evidence(session_id, position_ft);
             """
         )
@@ -108,6 +130,8 @@ def initialize_evidence_store() -> None:
             _migrate_v4_to_v5(con); stored = 5
         if stored == 5:
             _migrate_v5_to_v6(con); stored = 6
+        if stored == 6:
+            _migrate_v6_to_v7(con); stored = 7
         if stored != EVIDENCE_SCHEMA_VERSION:
             raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
 
@@ -116,15 +140,30 @@ def _decode_reasons(value: str | None) -> list[str] | None:
     return None if value is None else list(json.loads(value))
 
 
-def _evidence_row(con, evidence_id: int):
-    return con.execute(
-        """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
+def _evidence_select() -> str:
+    return """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
         g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
         g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast, g.min_edge_sharpness,
-        g.quality_policy_id, g.quality_status, g.quality_reasons_json
-        FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-        WHERE e.id=?""", (evidence_id,)
-    ).fetchone()
+        g.quality_policy_id, g.quality_status, g.quality_reasons_json,
+        fq.policy_id AS frame_quality_policy_id, fq.status AS frame_quality_status,
+        fq.sampled_pixels AS frame_sampled_pixels, fq.mean_intensity AS frame_mean_intensity,
+        fq.p05_intensity AS frame_p05_intensity, fq.p95_intensity AS frame_p95_intensity,
+        fq.dynamic_range AS frame_dynamic_range, fq.low_clipped_fraction AS frame_low_clipped_fraction,
+        fq.high_clipped_fraction AS frame_high_clipped_fraction, fq.reasons_json AS frame_quality_reasons_json
+        FROM inspection_evidence e
+        LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+        LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id"""
+
+
+def _decode_row(row) -> dict:
+    result = dict(row)
+    result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
+    result["frame_quality_reasons"] = _decode_reasons(result.pop("frame_quality_reasons_json"))
+    return result
+
+
+def _evidence_row(con, evidence_id: int):
+    return con.execute(_evidence_select() + " WHERE e.id=?", (evidence_id,)).fetchone()
 
 
 def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
@@ -148,29 +187,24 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
                 (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,
                  g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)),
             )
-        result = dict(_evidence_row(con, evidence_id))
-        result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
-        return result
+        if evidence.frame_quality is not None:
+            fq = evidence.frame_quality
+            con.execute(
+                """INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,
+                p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,
+                 fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)),
+            )
+        return _decode_row(_evidence_row(con, evidence_id))
 
 
 def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
     if limit < 1 or limit > 1000:
         raise ValueError("limit must be between 1 and 1000")
     with connect() as con:
-        rows = con.execute(
-            """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
-            g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
-            g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast, g.min_edge_sharpness,
-            g.quality_policy_id, g.quality_status, g.quality_reasons_json
-            FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-            WHERE e.session_id=? ORDER BY e.position_ft DESC, e.id DESC LIMIT ?""", (session_id, limit)
-        ).fetchall()
-        results=[]
-        for row in rows:
-            result=dict(row)
-            result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json"))
-            results.append(result)
-        return results
+        rows = con.execute(_evidence_select() + " WHERE e.session_id=? ORDER BY e.position_ft DESC, e.id DESC LIMIT ?", (session_id, limit)).fetchall()
+        return [_decode_row(row) for row in rows]
 
 
 def evidence_summary(session_id: int) -> dict:
@@ -182,9 +216,15 @@ def evidence_summary(session_id: int) -> dict:
             SUM(CASE WHEN e.status='FAIL' THEN 1 ELSE 0 END) fail_count,
             SUM(CASE WHEN g.quality_status='high-confidence' THEN 1 ELSE 0 END) high_confidence_geometry,
             SUM(CASE WHEN g.quality_status='degraded' THEN 1 ELSE 0 END) degraded_geometry,
+            SUM(CASE WHEN fq.status='high-confidence' THEN 1 ELSE 0 END) high_confidence_frame_quality,
+            SUM(CASE WHEN fq.status='degraded' THEN 1 ELSE 0 END) degraded_frame_quality,
             MIN(e.measured_width_in) min_width_in, MAX(e.measured_width_in) max_width_in
-            FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id WHERE e.session_id=?""", (session_id,)
+            FROM inspection_evidence e
+            LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+            LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id
+            WHERE e.session_id=?""", (session_id,)
         ).fetchone()
         return {"total":row["total"] or 0,"pass":row["pass_count"] or 0,"warning":row["warning_count"] or 0,
                 "fail":row["fail_count"] or 0,"high_confidence_geometry":row["high_confidence_geometry"] or 0,
-                "degraded_geometry":row["degraded_geometry"] or 0,"min_width_in":row["min_width_in"],"max_width_in":row["max_width_in"]}
+                "degraded_geometry":row["degraded_geometry"] or 0,"high_confidence_frame_quality":row["high_confidence_frame_quality"] or 0,
+                "degraded_frame_quality":row["degraded_frame_quality"] or 0,"min_width_in":row["min_width_in"],"max_width_in":row["max_width_in"]}
