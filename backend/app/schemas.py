@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 SessionStatus = Literal["ready", "inspecting", "paused", "complete"]
 ReviewStatus = Literal["open", "acknowledged", "false_positive"]
+RunLayoutInput = Literal["single", "slit-two-lane"]
 
 
 class SessionInput(BaseModel):
@@ -14,6 +15,7 @@ class SessionInput(BaseModel):
     target_width_in: float = Field(gt=0, le=120)
     tolerance_in: float = Field(gt=0, le=2)
     target_length_ft: float = Field(gt=0, le=100_000)
+    run_layout: RunLayoutInput = "single"
 
 
 class ProgressInput(BaseModel):
