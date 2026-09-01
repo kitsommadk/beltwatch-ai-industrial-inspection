@@ -12,7 +12,6 @@ from typing import Any, Protocol
 from .camera import FramePacket
 
 EDGE_CONTRAST_WINDOW_PX = 3
-EDGE_SHARPNESS_WINDOW_PX = 3
 
 
 @dataclass(frozen=True)
@@ -68,17 +67,16 @@ def _edge_contrast(row: Any, left: int, right: int, width: int) -> float | None:
 
 
 def _edge_sharpness(row: Any, left: int, right: int, width: int) -> float | None:
-    """Return the weakest peak adjacent-pixel gradient around either detected edge."""
-    w = EDGE_SHARPNESS_WINDOW_PX
-    if left < w or right + w > width or right - left < w:
+    """Return the weaker adjacent-pixel gradient at the detected threshold crossings.
+
+    Measuring exactly at each detected boundary avoids a nearby unrelated intensity
+    jump being mistaken for a sharp belt edge.
+    """
+    if left <= 0 or right >= width or right <= left:
         return None
-
-    def peak_gradient(center: int) -> float:
-        start = max(1, center - w)
-        stop = min(width - 1, center + w)
-        return max(abs(_intensity(row[x]) - _intensity(row[x - 1])) for x in range(start, stop + 1))
-
-    return float(min(peak_gradient(left), peak_gradient(right)))
+    left_gradient = abs(_intensity(row[left]) - _intensity(row[left - 1]))
+    right_gradient = abs(_intensity(row[right]) - _intensity(row[right - 1]))
+    return float(min(left_gradient, right_gradient))
 
 
 def estimate_dark_belt_span(image: Any, *, row_fraction: float = 0.5, threshold: float = 100.0, min_run_px: int = 20) -> BeltSpan:
