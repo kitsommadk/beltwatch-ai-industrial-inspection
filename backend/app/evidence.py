@@ -22,6 +22,7 @@ class GeometryProvenance:
     left_edge_spread_px: int
     right_edge_spread_px: int
     min_edge_contrast: float | None
+    min_edge_sharpness: float | None
     quality_policy_id: str
     quality_status: GeometryQualityStatus
     quality_reasons: tuple[str, ...]
@@ -42,6 +43,7 @@ class GeometryProvenance:
             left_edge_spread_px=span.left_edge_spread_px,
             right_edge_spread_px=span.right_edge_spread_px,
             min_edge_contrast=span.min_edge_contrast,
+            min_edge_sharpness=span.min_edge_sharpness,
             quality_policy_id=quality.policy_id,
             quality_status=quality.status,
             quality_reasons=quality.reasons,

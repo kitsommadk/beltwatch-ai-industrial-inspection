@@ -6,7 +6,7 @@ from .database import connect
 from .evidence import InspectionEvidence
 
 
-EVIDENCE_SCHEMA_VERSION = 5
+EVIDENCE_SCHEMA_VERSION = 6
 
 
 def _geometry_columns(con) -> set[str]:
@@ -38,6 +38,13 @@ def _migrate_v4_to_v5(con) -> None:
     if "min_edge_contrast" not in columns:
         con.execute("ALTER TABLE inspection_geometry ADD COLUMN min_edge_contrast REAL")
     con.execute("UPDATE evidence_schema_metadata SET schema_version=5 WHERE singleton_id=1")
+
+
+def _migrate_v5_to_v6(con) -> None:
+    columns = _geometry_columns(con)
+    if "min_edge_sharpness" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN min_edge_sharpness REAL")
+    con.execute("UPDATE evidence_schema_metadata SET schema_version=6 WHERE singleton_id=1")
 
 
 def initialize_evidence_store() -> None:
@@ -79,6 +86,7 @@ def initialize_evidence_store() -> None:
                 left_edge_spread_px INTEGER,
                 right_edge_spread_px INTEGER,
                 min_edge_contrast REAL,
+                min_edge_sharpness REAL,
                 quality_policy_id TEXT,
                 quality_status TEXT,
                 quality_reasons_json TEXT,
@@ -93,14 +101,13 @@ def initialize_evidence_store() -> None:
         con.execute("INSERT OR IGNORE INTO evidence_schema_metadata(singleton_id, schema_version) VALUES (1, ?)", (EVIDENCE_SCHEMA_VERSION,))
         stored = con.execute("SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1").fetchone()[0]
         if stored == 2:
-            _migrate_v2_to_v3(con)
-            stored = 3
+            _migrate_v2_to_v3(con); stored = 3
         if stored == 3:
-            _migrate_v3_to_v4(con)
-            stored = 4
+            _migrate_v3_to_v4(con); stored = 4
         if stored == 4:
-            _migrate_v4_to_v5(con)
-            stored = 5
+            _migrate_v4_to_v5(con); stored = 5
+        if stored == 5:
+            _migrate_v5_to_v6(con); stored = 6
         if stored != EVIDENCE_SCHEMA_VERSION:
             raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
 
@@ -113,7 +120,7 @@ def _evidence_row(con, evidence_id: int):
     return con.execute(
         """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
         g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
-        g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast,
+        g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast, g.min_edge_sharpness,
         g.quality_policy_id, g.quality_status, g.quality_reasons_json
         FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
         WHERE e.id=?""", (evidence_id,)
@@ -136,10 +143,10 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
             g = evidence.geometry
             con.execute(
                 """INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,
-                sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,
-                quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,min_edge_sharpness,
+                quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,
-                 g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)),
+                 g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)),
             )
         result = dict(_evidence_row(con, evidence_id))
         result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
@@ -153,7 +160,7 @@ def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
         rows = con.execute(
             """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
             g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
-            g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast,
+            g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px, g.min_edge_contrast, g.min_edge_sharpness,
             g.quality_policy_id, g.quality_status, g.quality_reasons_json
             FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
             WHERE e.session_id=? ORDER BY e.position_ft DESC, e.id DESC LIMIT ?""", (session_id, limit)
