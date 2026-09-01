@@ -81,6 +81,7 @@ def estimate_two_dark_belts(image: Any, *, row_fraction: float = 0.5, threshold:
     for lane_index, lane_id in enumerate(("belt-a", "belt-b")):
         lefts = [runs[lane_index][0] for _, runs in observations]
         rights = [runs[lane_index][1] for _, runs in observations]
+        widths = [right-left for left, right in zip(lefts, rights)]
         left = int(round(median(lefts)))
         right = int(round(median(rights)))
         if right <= left:
@@ -93,8 +94,9 @@ def estimate_two_dark_belts(image: Any, *, row_fraction: float = 0.5, threshold:
             row_y=representative_row,
             threshold=float(threshold),
             sampled_rows=len(observations),
-            left_position_spread_px=float(max(lefts)-min(lefts)),
-            right_position_spread_px=float(max(rights)-min(rights)),
+            span_spread_px=max(widths)-min(widths),
+            left_edge_spread_px=max(lefts)-min(lefts),
+            right_edge_spread_px=max(rights)-min(rights),
             min_edge_contrast=_edge_contrast(row,left,right,width),
             min_edge_sharpness=_edge_sharpness(row,left,right,width),
         )))
