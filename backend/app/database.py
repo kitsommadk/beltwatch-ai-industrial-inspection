@@ -4,27 +4,68 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+CURRENT_SCHEMA_VERSION = 1
+
+
 def db_path() -> Path:
-    return Path(os.getenv("BELTWATCH_DB_PATH", Path(__file__).parents[1] / "beltwatch.db"))
+    """Return a stable absolute SQLite path.
+
+    A relative BELTWATCH_DB_PATH is resolved against the backend directory rather
+    than the process working directory so Docker, tests, and service launchers do
+    not accidentally point BeltWatch at different databases.
+    """
+    configured = os.getenv("BELTWATCH_DB_PATH")
+    path = Path(configured).expanduser() if configured else BACKEND_ROOT / "beltwatch.db"
+    if not path.is_absolute():
+        path = BACKEND_ROOT / path
+    return path.resolve()
 
 
 @contextmanager
 def connect():
-    connection = sqlite3.connect(db_path())
+    path = db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     try:
         yield connection
         connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
     finally:
         connection.close()
 
 
+def foreign_keys_enabled() -> bool:
+    with connect() as con:
+        return bool(con.execute("PRAGMA foreign_keys").fetchone()[0])
+
+
+def schema_version() -> int | None:
+    with connect() as con:
+        row = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_metadata'"
+        ).fetchone()
+        if row is None:
+            return None
+        version = con.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton_id=1"
+        ).fetchone()
+        return int(version[0]) if version is not None else None
+
+
 def initialize() -> None:
-    db_path().parent.mkdir(parents=True, exist_ok=True)
     with connect() as con:
         con.executescript(
             """
+            CREATE TABLE IF NOT EXISTS schema_metadata (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                schema_version INTEGER NOT NULL CHECK(schema_version > 0)
+            );
+
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 roll_number TEXT NOT NULL,
@@ -64,4 +105,15 @@ def initialize() -> None:
             );
             """
         )
-
+        con.execute(
+            "INSERT OR IGNORE INTO schema_metadata(singleton_id, schema_version) VALUES (1, ?)",
+            (CURRENT_SCHEMA_VERSION,),
+        )
+        stored = con.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton_id=1"
+        ).fetchone()[0]
+        if stored != CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {stored} does not match application version {CURRENT_SCHEMA_VERSION}; "
+                "explicit migration is required"
+            )
