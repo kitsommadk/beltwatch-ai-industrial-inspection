@@ -30,7 +30,17 @@ def _trusted(session_id, position, width, lane="belt"):
 
 
 def _evidence(position, width):
-    measurement = WidthMeasurement(48.0, width, abs(width - 48.0), WidthStatus.PASS)
+    measurement = WidthMeasurement(
+        camera_id="top",
+        frame_sequence=99,
+        calibration_profile_id="cal",
+        calibration_version=1,
+        position_ft=position,
+        measured_width_in=width,
+        target_width_in=48.0,
+        absolute_deviation_in=abs(width - 48.0),
+        status=WidthStatus.PASS,
+    )
     return InspectionEvidence("top", 99, datetime(2026,9,1,12,1), "replay://new", position, "simulated", "cal", 1, 480, measurement)
 
 
