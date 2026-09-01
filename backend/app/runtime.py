@@ -24,7 +24,6 @@ class InspectionRuntime:
     mode: str
     evidence_services: dict[str, EvidenceService]
     span_estimators: dict[str, SpanEstimator] = field(default_factory=dict)
-    span_estimator_ids: dict[str, str] = field(default_factory=dict)
 
     def service_for(self, camera_id: str) -> EvidenceService:
         try:
@@ -38,14 +37,6 @@ class InspectionRuntime:
         except KeyError as exc:
             raise RuntimeConfigurationError(
                 f"automatic span estimation is not configured for camera {camera_id!r} in {self.mode!r} mode"
-            ) from exc
-
-    def estimator_id_for(self, camera_id: str) -> str:
-        try:
-            return self.span_estimator_ids[camera_id]
-        except KeyError as exc:
-            raise RuntimeConfigurationError(
-                f"span estimator identity is not configured for camera {camera_id!r} in {self.mode!r} mode"
             ) from exc
 
 
@@ -107,7 +98,6 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
 
     services: dict[str, EvidenceService] = {}
     estimators: dict[str, SpanEstimator] = {}
-    estimator_ids: dict[str, str] = {}
     for camera_id in ("top", "bottom"):
         position = SimulatedPositionProvider(start_ft=0.0, step_ft=1.0)
         calibration = _calibration(camera_id, selected)
@@ -115,17 +105,18 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
             camera = SimulatedCamera(camera_id)
         else:
             camera = ReplayCamera(camera_id, _replay_frames(camera_id), loop=False)
-            estimators[camera_id] = MultiRowDarkEstimator(
+            estimator = MultiRowDarkEstimator(
                 threshold=100,
                 min_run_px=100,
                 max_span_spread_px=12,
             )
-            estimator_ids[camera_id] = "multirow-dark-v1"
+            # Stable evidence provenance label for this configured algorithm contract.
+            estimator.provenance_id = "multirow-dark-v1"
+            estimators[camera_id] = estimator
         services[camera_id] = EvidenceService(camera, position, calibration)
 
     return InspectionRuntime(
         mode=selected,
         evidence_services=services,
         span_estimators=estimators,
-        span_estimator_ids=estimator_ids,
     )
