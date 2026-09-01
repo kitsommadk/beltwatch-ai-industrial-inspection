@@ -67,9 +67,11 @@ def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, t
         columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_geometry)")}
         evidence_columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_evidence)")}
         frame_quality_columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_frame_quality)")}
+        temporal_columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_temporal_quality)")}
         migrated = con.execute("SELECT lane_id, camera_id, frame_sequence, payload_ref FROM inspection_evidence").fetchone()
+        fk_issues = con.execute("PRAGMA foreign_key_check").fetchall()
 
-    assert version == EVIDENCE_SCHEMA_VERSION == 8
+    assert version == EVIDENCE_SCHEMA_VERSION == 9
     assert "lane_id" in evidence_columns
     assert migrated["lane_id"] == "belt"
     assert migrated["camera_id"] == "top"
@@ -83,3 +85,9 @@ def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, t
         "policy_id", "status", "sampled_pixels", "mean_intensity", "p05_intensity", "p95_intensity",
         "dynamic_range", "low_clipped_fraction", "high_clipped_fraction", "reasons_json",
     } <= frame_quality_columns
+    assert {
+        "evidence_id", "policy_id", "status", "history_count", "previous_width_in",
+        "history_median_width_in", "step_change_in", "median_deviation_in",
+        "previous_position_ft", "position_delta_ft", "width_change_per_ft", "reasons_json",
+    } <= temporal_columns
+    assert fk_issues == []

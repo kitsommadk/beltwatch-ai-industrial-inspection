@@ -4,9 +4,10 @@ import json
 
 from .database import connect
 from .evidence import InspectionEvidence
+from .temporal_quality import TemporalQualityResult
 
 
-EVIDENCE_SCHEMA_VERSION = 8
+EVIDENCE_SCHEMA_VERSION = 9
 
 
 def _geometry_columns(con) -> set[str]:
@@ -67,6 +68,29 @@ def _migrate_v7_to_v8(con) -> None:
         con.execute("PRAGMA foreign_keys = ON")
 
 
+def _create_temporal_table(con) -> None:
+    con.execute("""CREATE TABLE IF NOT EXISTS inspection_temporal_quality (
+        evidence_id INTEGER PRIMARY KEY,
+        policy_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('insufficient-history','incomparable','high-confidence','degraded','invalid')),
+        history_count INTEGER NOT NULL CHECK(history_count>=0),
+        previous_width_in REAL,
+        history_median_width_in REAL,
+        step_change_in REAL,
+        median_deviation_in REAL,
+        previous_position_ft REAL,
+        position_delta_ft REAL,
+        width_change_per_ft REAL,
+        reasons_json TEXT NOT NULL,
+        FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE
+    )""")
+
+
+def _migrate_v8_to_v9(con) -> None:
+    _create_temporal_table(con)
+    con.execute("UPDATE evidence_schema_metadata SET schema_version=9 WHERE singleton_id=1")
+
+
 def initialize_evidence_store() -> None:
     with connect() as con:
         con.executescript("""
@@ -93,6 +117,7 @@ def initialize_evidence_store() -> None:
             CHECK(sampled_pixels>0), CHECK(dynamic_range>=0), CHECK(low_clipped_fraction>=0 AND low_clipped_fraction<=1), CHECK(high_clipped_fraction>=0 AND high_clipped_fraction<=1));
         CREATE INDEX IF NOT EXISTS idx_evidence_session_position ON inspection_evidence(session_id, position_ft);
         """)
+        _create_temporal_table(con)
         con.execute("INSERT OR IGNORE INTO evidence_schema_metadata(singleton_id,schema_version) VALUES (1,?)", (EVIDENCE_SCHEMA_VERSION,))
         stored=con.execute("SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1").fetchone()[0]
         if stored==2: _migrate_v2_to_v3(con); stored=3
@@ -101,6 +126,7 @@ def initialize_evidence_store() -> None:
         if stored==5: _migrate_v5_to_v6(con); stored=6
         if stored==6: _migrate_v6_to_v7(con); stored=7
         if stored==7: _migrate_v7_to_v8(con); stored=8
+        if stored==8: _migrate_v8_to_v9(con); stored=9
         if stored != EVIDENCE_SCHEMA_VERSION:
             raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
 
@@ -114,18 +140,29 @@ def _evidence_select() -> str:
     fq.policy_id AS frame_quality_policy_id,fq.status AS frame_quality_status,fq.sampled_pixels AS frame_sampled_pixels,
     fq.mean_intensity AS frame_mean_intensity,fq.p05_intensity AS frame_p05_intensity,fq.p95_intensity AS frame_p95_intensity,
     fq.dynamic_range AS frame_dynamic_range,fq.low_clipped_fraction AS frame_low_clipped_fraction,fq.high_clipped_fraction AS frame_high_clipped_fraction,
-    fq.reasons_json AS frame_quality_reasons_json FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-    LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id"""
+    fq.reasons_json AS frame_quality_reasons_json,
+    tq.policy_id AS temporal_policy_id,tq.status AS temporal_status,tq.history_count AS temporal_history_count,
+    tq.previous_width_in AS temporal_previous_width_in,tq.history_median_width_in AS temporal_history_median_width_in,
+    tq.step_change_in AS temporal_step_change_in,tq.median_deviation_in AS temporal_median_deviation_in,
+    tq.previous_position_ft AS temporal_previous_position_ft,tq.position_delta_ft AS temporal_position_delta_ft,
+    tq.width_change_per_ft AS temporal_width_change_per_ft,tq.reasons_json AS temporal_reasons_json
+    FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+    LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id
+    LEFT JOIN inspection_temporal_quality tq ON tq.evidence_id=e.id"""
 
 
 def _decode_row(row):
-    result=dict(row); result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json")); result["frame_quality_reasons"]=_decode_reasons(result.pop("frame_quality_reasons_json")); return result
+    result=dict(row)
+    result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json"))
+    result["frame_quality_reasons"]=_decode_reasons(result.pop("frame_quality_reasons_json"))
+    result["temporal_reasons"]=_decode_reasons(result.pop("temporal_reasons_json"))
+    return result
 
 
 def _evidence_row(con,evidence_id): return con.execute(_evidence_select()+" WHERE e.id=?",(evidence_id,)).fetchone()
 
 
-def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt") -> dict:
+def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt", temporal: TemporalQualityResult | None = None) -> dict:
     if not lane_id.strip(): raise ValueError("lane_id must not be empty")
     width=evidence.width
     with connect() as con:
@@ -140,6 +177,12 @@ def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str
         if evidence.frame_quality is not None:
             fq=evidence.frame_quality; con.execute("""INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)))
+        if temporal is not None:
+            con.execute("""INSERT INTO inspection_temporal_quality(evidence_id,policy_id,status,history_count,previous_width_in,history_median_width_in,
+            step_change_in,median_deviation_in,previous_position_ft,position_delta_ft,width_change_per_ft,reasons_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (evidence_id,temporal.policy_id,temporal.status.value,temporal.history_count,temporal.previous_width_in,temporal.history_median_width_in,
+             temporal.step_change_in,temporal.median_deviation_in,temporal.previous_position_ft,temporal.position_delta_ft,temporal.width_change_per_ft,json.dumps(temporal.reasons)))
         return _decode_row(_evidence_row(con,evidence_id))
 
 
