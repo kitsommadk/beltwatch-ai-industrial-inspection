@@ -2,6 +2,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+np = pytest.importorskip("numpy")
+pytest.importorskip("cv2")
+
 from app.camera import FramePacket
 from app.cv_fixtures import make_belt_fixture
 from app.edge_span import MultiRowDarkEstimator
@@ -52,6 +55,15 @@ def test_generated_fixture_is_deterministic():
 def test_fixture_validation_rejects_impossible_geometry():
     with pytest.raises(ValueError, match="fit within"):
         make_belt_fixture(width=100, left=50, belt_width=80)
+
+
+def test_sparse_impulse_noise_does_not_expand_contour_span():
+    fixture = make_belt_fixture(impulse_noise_fraction=0.01, label="impulse-noise")
+    span = OpenCVContourEstimator(threshold=100).estimate(as_frame(fixture, 1))
+
+    assert span.left_x == fixture.expected_left_x
+    assert span.right_x_exclusive == fixture.expected_right_x_exclusive
+    assert span.span_px == fixture.expected_span_px
 
 
 def test_opencv_contour_provider_meets_generated_robustness_gate():
