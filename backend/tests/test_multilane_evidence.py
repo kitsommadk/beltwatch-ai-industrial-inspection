@@ -7,6 +7,9 @@ from app.multilane_evidence import capture_two_lane_width_auto
 from app.multilane_span import TwoLaneDarkEstimator
 
 
+FIXED_TIME = datetime(2026, 9, 1, 15, 30, tzinfo=timezone.utc)
+
+
 def _image(width=120, height=40):
     image = [[220 for _ in range(width)] for _ in range(height)]
     for y in range(height):
@@ -26,7 +29,7 @@ class OneFrameCamera:
         return FramePacket(
             camera_id="top",
             sequence=7,
-            captured_at=datetime(2026, 9, 1, 15, 30, tzinfo=timezone.utc),
+            captured_at=FIXED_TIME,
             width_px=120,
             height_px=40,
             payload_ref="generated://slit-frame-7",
@@ -40,7 +43,7 @@ class OnePosition:
 
     def sample(self):
         self.calls += 1
-        return PositionSample(position_ft=125.5, source="test-position")
+        return PositionSample(position_ft=125.5, sampled_at=FIXED_TIME, source="test-position")
 
 
 def _service():
@@ -52,6 +55,7 @@ def _service():
         version=1,
         pixels_per_inch=10.0,
         reference_width_in=12.0,
+        created_at=FIXED_TIME,
     )
     return EvidenceService(camera, position, calibration), camera, position
 
