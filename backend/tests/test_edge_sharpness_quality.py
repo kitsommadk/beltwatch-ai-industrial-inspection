@@ -8,11 +8,24 @@ def _frame(edge_values: tuple[int, ...], *, camera_id: str = "top") -> FramePack
     left = 20
     right = 100
     row = [220] * width
-    # Keep a dark interior while controlling how gradually each edge crosses the threshold.
     row[left:right] = [40] * (right - left)
     for offset, value in enumerate(edge_values):
         row[left - 1 + offset] = value
         row[right - len(edge_values) + offset] = value
+    image = tuple(tuple(row) for _ in range(20))
+    return FramePacket(camera_id=camera_id, sequence=1, captured_at=None, width_px=width, height_px=20, payload_ref="generated://sharpness", payload=image)
+
+
+def _symmetric_soft_frame(step: int, *, camera_id: str = "top") -> FramePacket:
+    """Build stable geometry with a controlled local gradient across both edges."""
+    width = 120
+    left = 20
+    right = 100
+    row = [220] * width
+    row[left:right] = [40] * (right - left)
+    # Keep threshold crossing fixed while varying only the adjacent-pixel gradient.
+    row[left - 2:left + 3] = [100 + 2 * step, 100 + step, 100 - step, 100 - 2 * step, 40]
+    row[right - 3:right + 2] = [40, 100 - 2 * step, 100 - step, 100 + step, 100 + 2 * step]
     image = tuple(tuple(row) for _ in range(20))
     return FramePacket(camera_id=camera_id, sequence=1, captured_at=None, width_px=width, height_px=20, payload_ref="generated://sharpness", payload=image)
 
@@ -39,7 +52,7 @@ def test_crisp_edges_are_high_confidence():
 
 
 def test_soft_edges_are_degraded_even_when_geometry_is_stable():
-    frame = _frame((150, 95, 60, 40))
+    frame = _symmetric_soft_frame(25)
     span = MultiRowDarkEstimator(row_fractions=(0.25, 0.5, 0.75), threshold=100, min_run_px=20).estimate(frame)
     assert span.span_spread_px == 0
     assert span.left_edge_spread_px == 0
@@ -49,7 +62,7 @@ def test_soft_edges_are_degraded_even_when_geometry_is_stable():
 
 
 def test_very_soft_edges_fail_closed():
-    frame = _frame((115, 105, 95, 85, 75))
+    frame = _symmetric_soft_frame(8)
     span = MultiRowDarkEstimator(row_fractions=(0.25, 0.5, 0.75), threshold=100, min_run_px=20).estimate(frame)
     result = assess_geometry(span, _policy())
     assert span.span_spread_px == 0
