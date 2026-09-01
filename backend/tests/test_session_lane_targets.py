@@ -66,6 +66,18 @@ def test_slit_auto_capture_persists_two_lanes_from_one_frame(tmp_path, monkeypat
         assert body["shared_frame_sequence"] == body["records"][0]["frame_sequence"]
         assert body["shared_position_ft"] == body["records"][0]["position_ft"]
 
+        diagnostics = body["diagnostics"]
+        assert set(diagnostics) == {
+            "gap_px", "belt_a_center_x_px", "belt_b_center_x_px",
+            "center_distance_px", "total_occupied_span_px",
+        }
+        assert diagnostics["gap_px"] >= 0
+        assert diagnostics["belt_a_center_x_px"] < diagnostics["belt_b_center_x_px"]
+        assert diagnostics["center_distance_px"] == pytest.approx(
+            diagnostics["belt_b_center_x_px"] - diagnostics["belt_a_center_x_px"]
+        )
+        assert diagnostics["total_occupied_span_px"] > 0
+
         persisted = client.get("/api/evidence").json()
         assert len(persisted) == 2
         assert {record["lane_id"] for record in persisted} == {"belt-a", "belt-b"}
