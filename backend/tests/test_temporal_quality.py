@@ -14,11 +14,12 @@ def _policy() -> TemporalQualityPolicy:
     )
 
 
-def test_first_trusted_measurement_initializes_baseline():
+def test_first_trusted_measurement_is_insufficient_history_not_high_confidence():
     result = assess_temporal_width(48.0, [], _policy())
-    assert result.status == TemporalQualityStatus.HIGH_CONFIDENCE
+    assert result.status == TemporalQualityStatus.INSUFFICIENT_HISTORY
     assert result.history_count == 0
     assert result.previous_width_in is None
+    assert result.step_change_in is None
 
 
 def test_stable_width_is_high_confidence():
