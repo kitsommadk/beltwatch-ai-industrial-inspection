@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 from .camera import FramePacket
 
+EDGE_CONTRAST_WINDOW_PX = 3
+
 
 @dataclass(frozen=True)
 class BeltSpan:
@@ -23,6 +25,7 @@ class BeltSpan:
     span_spread_px: int = 0
     left_edge_spread_px: int = 0
     right_edge_spread_px: int = 0
+    min_edge_contrast: float | None = None
 
 
 class SpanEstimator(Protocol):
@@ -50,6 +53,18 @@ def _intensity(pixel: Any) -> float:
     return sum(values) / len(values)
 
 
+def _edge_contrast(row: Any, left: int, right: int, width: int) -> float | None:
+    """Return the weaker of the left/right local intensity transitions."""
+    w = EDGE_CONTRAST_WINDOW_PX
+    if left < w or right + w > width or right - left < w:
+        return None
+    left_bg = median(_intensity(row[x]) for x in range(left - w, left))
+    left_belt = median(_intensity(row[x]) for x in range(left, left + w))
+    right_belt = median(_intensity(row[x]) for x in range(right - w, right))
+    right_bg = median(_intensity(row[x]) for x in range(right, right + w))
+    return float(min(abs(left_bg - left_belt), abs(right_bg - right_belt)))
+
+
 def estimate_dark_belt_span(image: Any, *, row_fraction: float = 0.5, threshold: float = 100.0, min_run_px: int = 20) -> BeltSpan:
     if not 0 <= row_fraction <= 1:
         raise ValueError("row_fraction must be between 0 and 1")
@@ -72,7 +87,8 @@ def estimate_dark_belt_span(image: Any, *, row_fraction: float = 0.5, threshold:
         best = (start, width)
     if best is None or best[1] - best[0] < min_run_px:
         raise ValueError("no belt-like dark span found on scanline")
-    return BeltSpan(best[0], best[1], best[1] - best[0], row_y, float(threshold))
+    contrast = _edge_contrast(row, best[0], best[1], width)
+    return BeltSpan(best[0], best[1], best[1] - best[0], row_y, float(threshold), min_edge_contrast=contrast)
 
 
 class DarkScanlineEstimator:
@@ -91,7 +107,7 @@ class DarkScanlineEstimator:
 
 
 class MultiRowDarkEstimator:
-    """Aggregate rows and retain independent left/right edge stability signals."""
+    """Aggregate rows and retain width, edge-position, and contrast quality signals."""
 
     def __init__(self, *, row_fractions: tuple[float, ...] = (0.25, 0.375, 0.5, 0.625, 0.75), threshold: float = 100.0, min_run_px: int = 20, min_valid_rows: int = 3, max_span_spread_px: int | None = 12) -> None:
         if not row_fractions:
@@ -122,6 +138,7 @@ class MultiRowDarkEstimator:
         widths = [s.span_px for s in spans]
         lefts = [s.left_x for s in spans]
         rights = [s.right_x_exclusive for s in spans]
+        contrasts = [s.min_edge_contrast for s in spans if s.min_edge_contrast is not None]
         span_spread = max(widths) - min(widths)
         left_spread = max(lefts) - min(lefts)
         right_spread = max(rights) - min(rights)
@@ -143,4 +160,5 @@ class MultiRowDarkEstimator:
             span_spread_px=span_spread,
             left_edge_spread_px=left_spread,
             right_edge_spread_px=right_spread,
+            min_edge_contrast=min(contrasts) if len(contrasts) == len(spans) else None,
         )

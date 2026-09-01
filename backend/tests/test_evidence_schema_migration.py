@@ -56,11 +56,12 @@ def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, t
         ).fetchone()[0]
         columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_geometry)")}
 
-    assert version == EVIDENCE_SCHEMA_VERSION == 4
+    assert version == EVIDENCE_SCHEMA_VERSION == 5
     assert {
         "quality_policy_id",
         "quality_status",
         "quality_reasons_json",
         "left_edge_spread_px",
         "right_edge_spread_px",
+        "min_edge_contrast",
     } <= columns
