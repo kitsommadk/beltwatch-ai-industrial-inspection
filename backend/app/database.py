@@ -5,16 +5,10 @@ from pathlib import Path
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def db_path() -> Path:
-    """Return a stable absolute SQLite path.
-
-    A relative BELTWATCH_DB_PATH is resolved against the backend directory rather
-    than the process working directory so Docker, tests, and service launchers do
-    not accidentally point BeltWatch at different databases.
-    """
     configured = os.getenv("BELTWATCH_DB_PATH")
     path = Path(configured).expanduser() if configured else BACKEND_ROOT / "beltwatch.db"
     if not path.is_absolute():
@@ -46,14 +40,10 @@ def foreign_keys_enabled() -> bool:
 
 def schema_version() -> int | None:
     with connect() as con:
-        row = con.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_metadata'"
-        ).fetchone()
+        row = con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_metadata'").fetchone()
         if row is None:
             return None
-        version = con.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton_id=1"
-        ).fetchone()
+        version = con.execute("SELECT schema_version FROM schema_metadata WHERE singleton_id=1").fetchone()
         return int(version[0]) if version is not None else None
 
 
@@ -64,11 +54,29 @@ def _session_columns(con) -> set[str]:
 def _migrate_v1_to_v2(con) -> None:
     columns = _session_columns(con)
     if "run_layout" not in columns:
-        con.execute(
-            "ALTER TABLE sessions ADD COLUMN run_layout TEXT NOT NULL DEFAULT 'single' "
-            "CHECK(run_layout IN ('single','slit-two-lane'))"
-        )
+        con.execute("ALTER TABLE sessions ADD COLUMN run_layout TEXT NOT NULL DEFAULT 'single' CHECK(run_layout IN ('single','slit-two-lane'))")
     con.execute("UPDATE schema_metadata SET schema_version=2 WHERE singleton_id=1")
+
+
+def _create_session_lanes(con) -> None:
+    con.execute(
+        """CREATE TABLE IF NOT EXISTS session_lanes (
+            session_id INTEGER NOT NULL,
+            lane_id TEXT NOT NULL CHECK(lane_id IN ('belt','belt-a','belt-b')),
+            target_width_in REAL NOT NULL CHECK(target_width_in > 0),
+            PRIMARY KEY(session_id, lane_id),
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )"""
+    )
+
+
+def _migrate_v2_to_v3(con) -> None:
+    _create_session_lanes(con)
+    con.execute(
+        """INSERT OR IGNORE INTO session_lanes(session_id, lane_id, target_width_in)
+           SELECT id, 'belt', target_width_in FROM sessions"""
+    )
+    con.execute("UPDATE schema_metadata SET schema_version=3 WHERE singleton_id=1")
 
 
 def initialize() -> None:
@@ -79,7 +87,6 @@ def initialize() -> None:
                 singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
                 schema_version INTEGER NOT NULL CHECK(schema_version > 0)
             );
-
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 roll_number TEXT NOT NULL,
@@ -95,7 +102,6 @@ def initialize() -> None:
                 updated_at TEXT NOT NULL,
                 run_layout TEXT NOT NULL DEFAULT 'single' CHECK(run_layout IN ('single','slit-two-lane'))
             );
-
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id INTEGER NOT NULL,
@@ -111,7 +117,6 @@ def initialize() -> None:
                 reviewed_at TEXT,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             );
-
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -120,18 +125,16 @@ def initialize() -> None:
             );
             """
         )
-        con.execute(
-            "INSERT OR IGNORE INTO schema_metadata(singleton_id, schema_version) VALUES (1, ?)",
-            (CURRENT_SCHEMA_VERSION,),
-        )
-        stored = con.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton_id=1"
-        ).fetchone()[0]
+        con.execute("INSERT OR IGNORE INTO schema_metadata(singleton_id, schema_version) VALUES (1, ?)", (CURRENT_SCHEMA_VERSION,))
+        stored = con.execute("SELECT schema_version FROM schema_metadata WHERE singleton_id=1").fetchone()[0]
         if stored == 1:
             _migrate_v1_to_v2(con)
             stored = 2
+        if stored == 2:
+            _migrate_v2_to_v3(con)
+            stored = 3
         if stored != CURRENT_SCHEMA_VERSION:
             raise RuntimeError(
-                f"database schema version {stored} does not match application version {CURRENT_SCHEMA_VERSION}; "
-                "explicit migration is required"
+                f"database schema version {stored} does not match application version {CURRENT_SCHEMA_VERSION}; explicit migration is required"
             )
+        _create_session_lanes(con)
