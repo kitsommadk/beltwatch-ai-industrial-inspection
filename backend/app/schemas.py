@@ -29,3 +29,9 @@ class DetectionRequest(BaseModel):
     kind: Literal["edge", "width", "surface"] = "edge"
     camera: Literal["Top", "Bottom"] | None = None
 
+
+class EvidenceCaptureRequest(BaseModel):
+    """Development capture input until a vision adapter supplies detected belt edges."""
+
+    camera: Literal["top", "bottom"]
+    measured_span_px: float = Field(gt=0, le=20_000)
