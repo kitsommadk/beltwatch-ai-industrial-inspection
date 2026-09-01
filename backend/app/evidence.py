@@ -11,7 +11,7 @@ from datetime import datetime
 from .calibration import CalibrationProfile, PositionProvider
 from .camera import CameraProvider, FramePacket
 from .edge_span import SpanEstimator
-from .measurement import WidthMeasurement, measure_width
+from .measurement import WidthMeasurement, WidthTolerance, measure_width_from_span
 
 
 @dataclass(frozen=True)
@@ -53,12 +53,16 @@ class EvidenceService:
             raise ValueError("camera and calibration profile do not match")
 
         position = self.position.sample()
-        width = measure_width(
-            measured_span_px=measured_span_px,
-            target_width_in=target_width_in,
+        width = measure_width_from_span(
+            frame=frame,
             calibration=self.calibration,
-            warning_tolerance_in=warning_tolerance_in,
-            fail_tolerance_in=fail_tolerance_in,
+            position=position,
+            belt_span_px=measured_span_px,
+            target_width_in=target_width_in,
+            tolerance=WidthTolerance(
+                warning_in=warning_tolerance_in,
+                fail_in=fail_tolerance_in,
+            ),
         )
 
         return InspectionEvidence(
