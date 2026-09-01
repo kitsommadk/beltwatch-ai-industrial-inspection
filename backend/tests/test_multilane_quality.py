@@ -51,6 +51,22 @@ def test_lane_edge_wander_is_measured_independently():
     assert b.span.span_spread_px == 4
 
 
+def test_weakest_sampled_row_controls_edge_contrast():
+    image = _image()
+    rows = _sample_rows(len(image), 0.5, 5)
+    for y in rows:
+        _paint(image[y], 10, 45, 20)
+        _paint(image[y], 75, 115, 20)
+    weak_row = rows[0]
+    _paint(image[weak_row], 10, 45, 80)
+
+    result = estimate_two_dark_belts(image, sample_count=5)
+    a, b = result.lanes
+    assert a.span.min_edge_contrast == pytest.approx(150.0)
+    assert b.span.min_edge_contrast == pytest.approx(210.0)
+    assert a.span.min_edge_contrast < b.span.min_edge_contrast
+
+
 def test_missing_second_belt_on_one_sampled_row_fails_closed():
     image = _image()
     for row in image:

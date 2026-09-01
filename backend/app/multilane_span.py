@@ -60,12 +60,29 @@ def _sample_rows(height: int, row_fraction: float, sample_count: int) -> list[in
     return sorted({int(round(start + (end - start) * i / (sample_count - 1))) for i in range(sample_count)})
 
 
+def _minimum_observed_edge_metric(image: Any, observations: list[tuple[int, list[tuple[int, int]]]], lane_index: int, width: int, metric) -> float | None:
+    """Return the weakest measurable edge value from the actual sampled rows.
+
+    Missing edge measurements remain unknown (`None`) instead of being encoded as
+    zero, because zero would falsely look like a measured poor-quality signal.
+    """
+    values: list[float] = []
+    for row_y, runs in observations:
+        left, right = runs[lane_index]
+        value = metric(image[row_y], left, right, width)
+        if value is None:
+            return None
+        values.append(float(value))
+    return min(values) if values else None
+
+
 def estimate_two_dark_belts(image: Any, *, row_fraction: float = 0.5, threshold: float = 100.0, min_run_px: int = 20, sample_count: int = 5) -> MultiLaneSpan:
     """Estimate two stable belt lanes using several rows instead of one scanline.
 
     Every sampled row must contain exactly two belt-like dark runs. Runs are
     associated left-to-right within each row, then median edges form Belt A/B.
     Ambiguous or missing rows fail closed rather than manufacturing a width.
+    Edge contrast/sharpness report the weakest actual sampled-row observation.
     """
     width, height = _dimensions(image)
     rows = _sample_rows(height, row_fraction, sample_count)
@@ -86,7 +103,6 @@ def estimate_two_dark_belts(image: Any, *, row_fraction: float = 0.5, threshold:
         right = int(round(median(rights)))
         if right <= left:
             raise ValueError(f"invalid aggregated span for {lane_id}")
-        row = image[representative_row]
         lanes.append(LaneSpan(lane_id=lane_id, span=BeltSpan(
             left_x=left,
             right_x_exclusive=right,
@@ -97,8 +113,8 @@ def estimate_two_dark_belts(image: Any, *, row_fraction: float = 0.5, threshold:
             span_spread_px=max(widths)-min(widths),
             left_edge_spread_px=max(lefts)-min(lefts),
             right_edge_spread_px=max(rights)-min(rights),
-            min_edge_contrast=_edge_contrast(row,left,right,width),
-            min_edge_sharpness=_edge_sharpness(row,left,right,width),
+            min_edge_contrast=_minimum_observed_edge_metric(image,observations,lane_index,width,_edge_contrast),
+            min_edge_sharpness=_minimum_observed_edge_metric(image,observations,lane_index,width,_edge_sharpness),
         )))
     return MultiLaneSpan(tuple(lanes))
 
