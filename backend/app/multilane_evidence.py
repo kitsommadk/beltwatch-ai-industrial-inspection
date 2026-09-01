@@ -7,6 +7,7 @@ from .frame_quality import DEFAULT_FRAME_QUALITY_POLICY, FrameQualityError, Fram
 from .geometry_quality import DEFAULT_GEOMETRY_QUALITY_POLICY, GeometryQualityError, GeometryQualityPolicy, GeometryQualityStatus, assess_geometry
 from .measurement import WidthTolerance, measure_width_from_span
 from .multilane_span import MultiLaneSpan, TwoLaneDarkEstimator
+from .slit_diagnostics import SlitPairDiagnostics, derive_slit_pair_diagnostics
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,13 @@ class LaneInspectionEvidence:
     evidence: InspectionEvidence
 
 
-def capture_two_lane_width_auto(
+@dataclass(frozen=True)
+class TwoLaneCaptureResult:
+    lanes: tuple[LaneInspectionEvidence, LaneInspectionEvidence]
+    diagnostics: SlitPairDiagnostics
+
+
+def capture_two_lane_inspection_auto(
     service,
     estimator: TwoLaneDarkEstimator,
     target_width_by_lane: dict[str, float],
@@ -26,12 +33,12 @@ def capture_two_lane_width_auto(
     quality_policy: GeometryQualityPolicy | None = None,
     frame_quality_policy: FrameQualityPolicy | None = None,
     require_high_confidence: bool = True,
-) -> tuple[LaneInspectionEvidence, LaneInspectionEvidence]:
-    """Capture one frame and derive independent Belt A/B widths from that exact frame.
+) -> TwoLaneCaptureResult:
+    """Capture one frame and return A/B evidence plus pairwise diagnostics.
 
-    Both lane records intentionally share frame sequence, timestamp, payload reference,
-    and one sampled physical position. This prevents A/B measurements from drifting
-    apart because of separate camera captures or position samples.
+    The estimator runs exactly once. Lane widths and pair diagnostics therefore share
+    the same frame and same sampled physical position, avoiding duplicate inference
+    or cross-frame drift.
     """
     expected_lanes = {"belt-a", "belt-b"}
     if set(target_width_by_lane) != expected_lanes:
@@ -48,6 +55,7 @@ def capture_two_lane_width_auto(
     result: MultiLaneSpan = estimator.estimate(frame)
     if {lane.lane_id for lane in result.lanes} != expected_lanes:
         raise ValueError("two-lane estimator did not return belt-a and belt-b")
+    diagnostics = derive_slit_pair_diagnostics(result)
 
     position = service.position.sample()
     resolved_estimator_id = estimator_id or getattr(estimator, "provenance_id", None) or estimator.__class__.__name__
@@ -83,4 +91,30 @@ def capture_two_lane_width_auto(
         )
         captured.append(LaneInspectionEvidence(lane.lane_id, evidence))
 
-    return captured[0], captured[1]
+    return TwoLaneCaptureResult((captured[0], captured[1]), diagnostics)
+
+
+def capture_two_lane_width_auto(
+    service,
+    estimator: TwoLaneDarkEstimator,
+    target_width_by_lane: dict[str, float],
+    warning_tolerance_in: float,
+    fail_tolerance_in: float,
+    *,
+    estimator_id: str | None = None,
+    quality_policy: GeometryQualityPolicy | None = None,
+    frame_quality_policy: FrameQualityPolicy | None = None,
+    require_high_confidence: bool = True,
+) -> tuple[LaneInspectionEvidence, LaneInspectionEvidence]:
+    """Backward-compatible lane-only wrapper around richer two-lane capture."""
+    return capture_two_lane_inspection_auto(
+        service,
+        estimator,
+        target_width_by_lane,
+        warning_tolerance_in,
+        fail_tolerance_in,
+        estimator_id=estimator_id,
+        quality_policy=quality_policy,
+        frame_quality_policy=frame_quality_policy,
+        require_high_confidence=require_high_confidence,
+    ).lanes
