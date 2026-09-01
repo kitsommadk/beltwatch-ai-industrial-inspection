@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import lru_cache
 import os
@@ -10,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .database import connect, initialize
 from .detection import SimulatedDetector
 from .evidence_store import evidence_summary, initialize_evidence_store, list_evidence, save_evidence
-from .multilane_evidence import capture_two_lane_width_auto
+from .multilane_evidence import capture_two_lane_inspection_auto
 from .runtime import InspectionRuntime, RuntimeConfigurationError, build_runtime
 from .schemas import DetectionRequest, EvidenceAutoCaptureRequest, EvidenceCaptureRequest, EventReview, ProgressInput, SessionInput
 from .temporal_evidence import assess_evidence_temporally
@@ -126,10 +127,11 @@ def capture_evidence_auto(payload:EvidenceAutoCaptureRequest,runtime:InspectionR
             return _persist_auto_evidence(ctx["session_id"],evidence,lane_id="belt")
         if set(ctx["lane_targets"])!={"belt-a","belt-b"}:raise RuntimeConfigurationError("slit-two-lane session is missing exact belt-a/b targets")
         service=runtime.two_lane_service_for(payload.camera); estimator=runtime.two_lane_estimator_for(payload.camera)
-        lanes=capture_two_lane_width_auto(service,estimator,ctx["lane_targets"],ctx["tolerance_in"],ctx["tolerance_in"]*2)
-        saved=[_persist_auto_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in lanes]
-        with connect() as con: audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b")
-        return {"run_layout":"slit-two-lane","shared_frame_sequence":saved[0]["frame_sequence"],"shared_position_ft":saved[0]["position_ft"],"records":saved}
+        capture=capture_two_lane_inspection_auto(service,estimator,ctx["lane_targets"],ctx["tolerance_in"],ctx["tolerance_in"]*2)
+        saved=[_persist_auto_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in capture.lanes]
+        diagnostics=asdict(capture.diagnostics)
+        with connect() as con: audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b gap_px={diagnostics['gap_px']}")
+        return {"run_layout":"slit-two-lane","shared_frame_sequence":saved[0]["frame_sequence"],"shared_position_ft":saved[0]["position_ft"],"records":saved,"diagnostics":diagnostics}
     except (RuntimeConfigurationError,ValueError,RuntimeError,EOFError) as exc:raise HTTPException(422,str(exc)) from exc
 
 @app.get("/api/evidence")
