@@ -12,6 +12,9 @@ from .calibration import CalibrationProfile, PositionSample
 from .camera import FramePacket
 
 
+METROLOGY_DECIMALS = 6
+
+
 class WidthStatus(str, Enum):
     PASS = "PASS"
     WARNING = "WARNING"
@@ -51,7 +54,9 @@ def classify_width(
     if measured_width_in < 0 or target_width_in <= 0:
         raise ValueError("widths must be physically valid")
 
-    deviation = abs(measured_width_in - target_width_in)
+    # Round before comparing boundaries so binary floating-point representation
+    # cannot turn an intended 0.100000 in deviation into 0.10000000000000142.
+    deviation = round(abs(measured_width_in - target_width_in), METROLOGY_DECIMALS)
     if deviation <= tolerance.warning_in:
         return WidthStatus.PASS, deviation
     if deviation <= tolerance.fail_in:
@@ -70,6 +75,10 @@ def measure_width_from_span(
 ) -> WidthMeasurement:
     if frame.camera_id != calibration.camera_id:
         raise ValueError("frame and calibration camera_id must match")
+    if belt_span_px <= 0:
+        raise ValueError("belt_span_px must be greater than zero")
+    if belt_span_px > frame.width_px:
+        raise ValueError("belt_span_px cannot exceed the frame width")
 
     measured_width_in = calibration.inches_from_pixels(belt_span_px)
     status, deviation = classify_width(measured_width_in, target_width_in, tolerance)
