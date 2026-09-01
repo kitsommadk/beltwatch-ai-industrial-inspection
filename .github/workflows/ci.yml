@@ -32,7 +32,7 @@ jobs:
             backend/requirements-cv.txt
       - run: pip install -r requirements-dev.txt -r requirements-cv.txt
         working-directory: backend
-      - run: PYTHONPATH=. pytest -q tests/test_opencv_span.py
+      - run: PYTHONPATH=. pytest -q tests/test_opencv_span.py tests/test_cv_robustness.py
         working-directory: backend
 
   frontend:
