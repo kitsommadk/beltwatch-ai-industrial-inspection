@@ -5,10 +5,10 @@ behavior, and frame contracts can be tested before hardware-specific dependencie
 are introduced.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from itertools import count
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 
 Clock = Callable[[], datetime]
@@ -26,6 +26,7 @@ class FramePacket:
     width_px: int
     height_px: int
     payload_ref: str
+    payload: Any | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
