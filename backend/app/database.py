@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def db_path() -> Path:
@@ -57,6 +57,20 @@ def schema_version() -> int | None:
         return int(version[0]) if version is not None else None
 
 
+def _session_columns(con) -> set[str]:
+    return {row["name"] for row in con.execute("PRAGMA table_info(sessions)").fetchall()}
+
+
+def _migrate_v1_to_v2(con) -> None:
+    columns = _session_columns(con)
+    if "run_layout" not in columns:
+        con.execute(
+            "ALTER TABLE sessions ADD COLUMN run_layout TEXT NOT NULL DEFAULT 'single' "
+            "CHECK(run_layout IN ('single','slit-two-lane'))"
+        )
+    con.execute("UPDATE schema_metadata SET schema_version=2 WHERE singleton_id=1")
+
+
 def initialize() -> None:
     with connect() as con:
         con.executescript(
@@ -78,7 +92,8 @@ def initialize() -> None:
                 current_width_in REAL NOT NULL,
                 status TEXT NOT NULL DEFAULT 'ready',
                 started_at TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                run_layout TEXT NOT NULL DEFAULT 'single' CHECK(run_layout IN ('single','slit-two-lane'))
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -112,6 +127,9 @@ def initialize() -> None:
         stored = con.execute(
             "SELECT schema_version FROM schema_metadata WHERE singleton_id=1"
         ).fetchone()[0]
+        if stored == 1:
+            _migrate_v1_to_v2(con)
+            stored = 2
         if stored != CURRENT_SCHEMA_VERSION:
             raise RuntimeError(
                 f"database schema version {stored} does not match application version {CURRENT_SCHEMA_VERSION}; "
