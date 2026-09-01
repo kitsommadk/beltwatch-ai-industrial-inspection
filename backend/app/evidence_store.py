@@ -1,6 +1,7 @@
 """SQLite persistence for traceable BeltWatch inspection evidence."""
 
 import json
+from dataclasses import dataclass
 
 from .database import connect
 from .evidence import InspectionEvidence
@@ -8,6 +9,13 @@ from .temporal_quality import TemporalQualityResult
 
 
 EVIDENCE_SCHEMA_VERSION = 9
+
+
+@dataclass(frozen=True)
+class EvidenceWrite:
+    evidence: InspectionEvidence
+    lane_id: str = "belt"
+    temporal: TemporalQualityResult | None = None
 
 
 def _geometry_columns(con) -> set[str]:
@@ -162,28 +170,43 @@ def _decode_row(row):
 def _evidence_row(con,evidence_id): return con.execute(_evidence_select()+" WHERE e.id=?",(evidence_id,)).fetchone()
 
 
-def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt", temporal: TemporalQualityResult | None = None) -> dict:
+def _insert_evidence(con, session_id: int, write: EvidenceWrite) -> int:
+    lane_id=write.lane_id
     if not lane_id.strip(): raise ValueError("lane_id must not be empty")
-    width=evidence.width
+    evidence=write.evidence; width=evidence.width
+    cursor=con.execute("""INSERT INTO inspection_evidence(session_id,camera_id,frame_sequence,lane_id,captured_at,payload_ref,position_ft,position_source,
+    calibration_profile_id,calibration_version,measured_span_px,target_width_in,measured_width_in,deviation_in,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (session_id,evidence.camera_id,evidence.frame_sequence,lane_id,evidence.captured_at.isoformat(),evidence.payload_ref,evidence.position_ft,evidence.position_source,
+    evidence.calibration_profile_id,evidence.calibration_version,evidence.measured_span_px,width.target_width_in,width.measured_width_in,width.absolute_deviation_in,width.status.value))
+    evidence_id=cursor.lastrowid
+    if evidence.geometry is not None:
+        g=evidence.geometry; con.execute("""INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,min_edge_sharpness,quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)))
+    if evidence.frame_quality is not None:
+        fq=evidence.frame_quality; con.execute("""INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)))
+    if write.temporal is not None:
+        temporal=write.temporal; con.execute("""INSERT INTO inspection_temporal_quality(evidence_id,policy_id,status,history_count,previous_width_in,history_median_width_in,
+        step_change_in,median_deviation_in,previous_position_ft,position_delta_ft,width_change_per_ft,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,temporal.policy_id,temporal.status.value,temporal.history_count,temporal.previous_width_in,temporal.history_median_width_in,
+         temporal.step_change_in,temporal.median_deviation_in,temporal.previous_position_ft,temporal.position_delta_ft,temporal.width_change_per_ft,json.dumps(temporal.reasons)))
+    return evidence_id
+
+
+def save_evidence_batch(session_id: int, writes: list[EvidenceWrite] | tuple[EvidenceWrite, ...]) -> list[dict]:
+    """Persist related evidence records in one SQLite transaction.
+
+    If any lane or child provenance write fails, the entire batch rolls back so a
+    shared slit frame cannot be represented by only one persisted lane.
+    """
+    if not writes: raise ValueError("writes must not be empty")
     with connect() as con:
-        cursor=con.execute("""INSERT INTO inspection_evidence(session_id,camera_id,frame_sequence,lane_id,captured_at,payload_ref,position_ft,position_source,
-        calibration_profile_id,calibration_version,measured_span_px,target_width_in,measured_width_in,deviation_in,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (session_id,evidence.camera_id,evidence.frame_sequence,lane_id,evidence.captured_at.isoformat(),evidence.payload_ref,evidence.position_ft,evidence.position_source,
-        evidence.calibration_profile_id,evidence.calibration_version,evidence.measured_span_px,width.target_width_in,width.measured_width_in,width.absolute_deviation_in,width.status.value))
-        evidence_id=cursor.lastrowid
-        if evidence.geometry is not None:
-            g=evidence.geometry; con.execute("""INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,min_edge_sharpness,quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)))
-        if evidence.frame_quality is not None:
-            fq=evidence.frame_quality; con.execute("""INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)))
-        if temporal is not None:
-            con.execute("""INSERT INTO inspection_temporal_quality(evidence_id,policy_id,status,history_count,previous_width_in,history_median_width_in,
-            step_change_in,median_deviation_in,previous_position_ft,position_delta_ft,width_change_per_ft,reasons_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,temporal.policy_id,temporal.status.value,temporal.history_count,temporal.previous_width_in,temporal.history_median_width_in,
-             temporal.step_change_in,temporal.median_deviation_in,temporal.previous_position_ft,temporal.position_delta_ft,temporal.width_change_per_ft,json.dumps(temporal.reasons)))
-        return _decode_row(_evidence_row(con,evidence_id))
+        evidence_ids=[_insert_evidence(con,session_id,write) for write in writes]
+        return [_decode_row(_evidence_row(con,evidence_id)) for evidence_id in evidence_ids]
+
+
+def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt", temporal: TemporalQualityResult | None = None) -> dict:
+    return save_evidence_batch(session_id,[EvidenceWrite(evidence=evidence,lane_id=lane_id,temporal=temporal)])[0]
 
 
 def list_evidence(session_id:int,limit:int=250):
