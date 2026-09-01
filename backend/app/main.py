@@ -13,6 +13,8 @@ from .evidence_store import evidence_summary, initialize_evidence_store, list_ev
 from .multilane_evidence import capture_two_lane_width_auto
 from .runtime import InspectionRuntime, RuntimeConfigurationError, build_runtime
 from .schemas import DetectionRequest, EvidenceAutoCaptureRequest, EvidenceCaptureRequest, EventReview, ProgressInput, SessionInput
+from .temporal_evidence import assess_evidence_temporally
+from .temporal_quality import TemporalQualityPolicy
 
 
 def now() -> str: return datetime.now(timezone.utc).isoformat()
@@ -24,6 +26,8 @@ def _session_response(con, session):
     result=row_dict(session); result["lane_targets"]=_lane_targets(con,session["id"]); return result
 def audit(con,action:str,detail:str)->None: con.execute("INSERT INTO audit_log(created_at,action,detail) VALUES (?,?,?)",(now(),action,detail))
 
+TEMPORAL_POLICY=TemporalQualityPolicy(policy_id="pilot-temporal-v1")
+
 @lru_cache
 def get_runtime()->InspectionRuntime:
     try: return build_runtime()
@@ -32,7 +36,7 @@ def get_runtime()->InspectionRuntime:
 @asynccontextmanager
 async def lifespan(_app:FastAPI): initialize(); initialize_evidence_store(); yield
 
-app=FastAPI(title="BeltWatch AI Pilot API",description="Local-first inspection workflow API with explicit simulation and replay validation modes.",version="0.8.0",lifespan=lifespan)
+app=FastAPI(title="BeltWatch AI Pilot API",description="Local-first inspection workflow API with explicit simulation and replay validation modes.",version="0.9.0",lifespan=lifespan)
 origins=[x.strip() for x in os.getenv("BELTWATCH_ALLOWED_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=["GET","POST"],allow_headers=["Content-Type"])
 detector=SimulatedDetector()
@@ -93,12 +97,16 @@ def _active_session_context():
         if s["status"]!="inspecting":raise HTTPException(409,"Inspection evidence can only be captured while the session is inspecting")
         return {"session_id":s["id"],"run_layout":s["run_layout"],"target_width_in":s["target_width_in"],"tolerance_in":s["tolerance_in"],"lane_targets":_lane_targets(con,s["id"])}
 
-def _persist_captured_evidence(session_id,evidence,*,lane_id="belt",update_current_width=True):
-    saved=save_evidence(session_id,evidence,lane_id=lane_id)
+def _persist_captured_evidence(session_id,evidence,*,lane_id="belt",update_current_width=True,temporal=None):
+    saved=save_evidence(session_id,evidence,lane_id=lane_id,temporal=temporal)
     with connect() as con:
         if update_current_width: con.execute("UPDATE sessions SET current_width_in=?,updated_at=? WHERE id=?",(saved["measured_width_in"],now(),session_id))
-        audit(con,"evidence.captured",f"evidence={saved['id']} lane={lane_id} camera={saved['camera_id']} position_ft={saved['position_ft']} status={saved['status']}")
+        audit(con,"evidence.captured",f"evidence={saved['id']} lane={lane_id} camera={saved['camera_id']} position_ft={saved['position_ft']} status={saved['status']} temporal={saved.get('temporal_status')}")
     return saved
+
+def _persist_auto_evidence(session_id,evidence,*,lane_id="belt",update_current_width=True):
+    temporal=assess_evidence_temporally(session_id,lane_id,evidence,TEMPORAL_POLICY)
+    return _persist_captured_evidence(session_id,evidence,lane_id=lane_id,update_current_width=update_current_width,temporal=temporal)
 
 @app.post("/api/evidence/capture")
 def capture_evidence(payload:EvidenceCaptureRequest,runtime:InspectionRuntime=Depends(get_runtime)):
@@ -115,11 +123,11 @@ def capture_evidence_auto(payload:EvidenceAutoCaptureRequest,runtime:InspectionR
     try:
         if ctx["run_layout"]=="single":
             service=runtime.service_for(payload.camera); estimator=runtime.estimator_for(payload.camera); evidence=service.capture_width_auto(estimator=estimator,target_width_in=ctx["target_width_in"],warning_tolerance_in=ctx["tolerance_in"],fail_tolerance_in=ctx["tolerance_in"]*2)
-            return _persist_captured_evidence(ctx["session_id"],evidence,lane_id="belt")
+            return _persist_auto_evidence(ctx["session_id"],evidence,lane_id="belt")
         if set(ctx["lane_targets"])!={"belt-a","belt-b"}:raise RuntimeConfigurationError("slit-two-lane session is missing exact belt-a/b targets")
         service=runtime.two_lane_service_for(payload.camera); estimator=runtime.two_lane_estimator_for(payload.camera)
         lanes=capture_two_lane_width_auto(service,estimator,ctx["lane_targets"],ctx["tolerance_in"],ctx["tolerance_in"]*2)
-        saved=[_persist_captured_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in lanes]
+        saved=[_persist_auto_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in lanes]
         with connect() as con: audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b")
         return {"run_layout":"slit-two-lane","shared_frame_sequence":saved[0]["frame_sequence"],"shared_position_ft":saved[0]["position_ft"],"records":saved}
     except (RuntimeConfigurationError,ValueError,RuntimeError,EOFError) as exc:raise HTTPException(422,str(exc)) from exc

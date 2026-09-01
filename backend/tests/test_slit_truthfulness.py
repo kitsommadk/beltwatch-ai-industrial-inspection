@@ -42,6 +42,8 @@ def test_single_auto_capture_keeps_legacy_raw_record_response(tmp_path, monkeypa
         assert captured.status_code == 200, captured.text
         body = captured.json()
         assert body["lane_id"] == "belt"
+        assert body["temporal_status"] == "insufficient-history"
+        assert body["temporal_policy_id"] == "pilot-temporal-v1"
         assert "records" not in body
         assert "run_layout" not in body
 
@@ -62,10 +64,13 @@ def test_slit_auto_capture_does_not_masquerade_belt_a_as_scalar_width(tmp_path, 
         initial = started["current_width_in"]
         captured = client.post("/api/evidence/capture-auto", json={"camera": "top"})
         assert captured.status_code == 200, captured.text
-        assert len(captured.json()["records"]) == 2
+        records = captured.json()["records"]
+        assert len(records) == 2
+        assert {record["lane_id"] for record in records} == {"belt-a", "belt-b"}
+        assert {record["temporal_status"] for record in records} == {"insufficient-history"}
         session = client.get("/api/session").json()
         assert session["current_width_in"] == initial
-        assert session["current_width_in"] != captured.json()["records"][0]["measured_width_in"]
+        assert session["current_width_in"] != records[0]["measured_width_in"]
 
 
 def test_slit_simulated_width_event_is_rejected_until_lane_aware(tmp_path, monkeypatch):
