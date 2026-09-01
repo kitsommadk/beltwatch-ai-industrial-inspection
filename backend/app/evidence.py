@@ -6,6 +6,7 @@ from datetime import datetime
 from .calibration import CalibrationProfile, PositionProvider
 from .camera import CameraProvider, FramePacket
 from .edge_span import BeltSpan, SpanEstimator
+from .frame_quality import DEFAULT_FRAME_QUALITY_POLICY, FrameQualityError, FrameQualityPolicy, FrameQualityStatus, assess_frame_quality
 from .geometry_quality import DEFAULT_GEOMETRY_QUALITY_POLICY, GeometryQualityError, GeometryQualityPolicy, GeometryQualityStatus, assess_geometry
 from .measurement import WidthMeasurement, WidthTolerance, measure_width_from_span
 
@@ -51,6 +52,39 @@ class GeometryProvenance:
 
 
 @dataclass(frozen=True)
+class FrameQualityProvenance:
+    policy_id: str
+    status: FrameQualityStatus
+    sampled_pixels: int
+    mean_intensity: float
+    p05_intensity: float
+    p95_intensity: float
+    dynamic_range: float
+    low_clipped_fraction: float
+    high_clipped_fraction: float
+    reasons: tuple[str, ...]
+
+    @classmethod
+    def from_frame(cls, frame: FramePacket, policy: FrameQualityPolicy) -> "FrameQualityProvenance":
+        if frame.payload is None:
+            raise ValueError("frame has no image payload for frame quality assessment")
+        result = assess_frame_quality(frame.payload, policy)
+        metrics = result.metrics
+        return cls(
+            policy_id=result.policy_id,
+            status=result.status,
+            sampled_pixels=metrics.sampled_pixels,
+            mean_intensity=metrics.mean_intensity,
+            p05_intensity=metrics.p05_intensity,
+            p95_intensity=metrics.p95_intensity,
+            dynamic_range=metrics.dynamic_range,
+            low_clipped_fraction=metrics.low_clipped_fraction,
+            high_clipped_fraction=metrics.high_clipped_fraction,
+            reasons=result.reasons,
+        )
+
+
+@dataclass(frozen=True)
 class InspectionEvidence:
     camera_id: str
     frame_sequence: int
@@ -63,6 +97,7 @@ class InspectionEvidence:
     measured_span_px: float
     width: WidthMeasurement
     geometry: GeometryProvenance | None = None
+    frame_quality: FrameQualityProvenance | None = None
 
 
 class EvidenceService:
@@ -71,7 +106,7 @@ class EvidenceService:
         self.position = position
         self.calibration = calibration
 
-    def _build_width_evidence(self, frame: FramePacket, measured_span_px: float, target_width_in: float, warning_tolerance_in: float, fail_tolerance_in: float, geometry: GeometryProvenance | None = None) -> InspectionEvidence:
+    def _build_width_evidence(self, frame: FramePacket, measured_span_px: float, target_width_in: float, warning_tolerance_in: float, fail_tolerance_in: float, geometry: GeometryProvenance | None = None, frame_quality: FrameQualityProvenance | None = None) -> InspectionEvidence:
         if frame.camera_id != self.calibration.camera_id:
             raise ValueError("camera and calibration profile do not match")
         position = self.position.sample()
@@ -83,18 +118,23 @@ class EvidenceService:
             target_width_in=target_width_in,
             tolerance=WidthTolerance(warning_in=warning_tolerance_in, fail_in=fail_tolerance_in),
         )
-        return InspectionEvidence(frame.camera_id, frame.sequence, frame.captured_at, frame.payload_ref, position.position_ft, position.source, self.calibration.profile_id, self.calibration.version, measured_span_px, width, geometry)
+        return InspectionEvidence(frame.camera_id, frame.sequence, frame.captured_at, frame.payload_ref, position.position_ft, position.source, self.calibration.profile_id, self.calibration.version, measured_span_px, width, geometry, frame_quality)
 
     def capture_width(self, measured_span_px: float, target_width_in: float, warning_tolerance_in: float, fail_tolerance_in: float) -> InspectionEvidence:
         frame = self.camera.capture()
         return self._build_width_evidence(frame, measured_span_px, target_width_in, warning_tolerance_in, fail_tolerance_in)
 
-    def capture_width_auto(self, estimator: SpanEstimator, target_width_in: float, warning_tolerance_in: float, fail_tolerance_in: float, *, estimator_id: str | None = None, quality_policy: GeometryQualityPolicy | None = None, require_high_confidence: bool = True) -> InspectionEvidence:
+    def capture_width_auto(self, estimator: SpanEstimator, target_width_in: float, warning_tolerance_in: float, fail_tolerance_in: float, *, estimator_id: str | None = None, quality_policy: GeometryQualityPolicy | None = None, frame_quality_policy: FrameQualityPolicy | None = None, require_high_confidence: bool = True) -> InspectionEvidence:
         frame = self.camera.capture()
+        resolved_frame_policy = frame_quality_policy or getattr(estimator, "frame_quality_policy", None) or DEFAULT_FRAME_QUALITY_POLICY
+        frame_provenance = FrameQualityProvenance.from_frame(frame, resolved_frame_policy)
+        if require_high_confidence and frame_provenance.status != FrameQualityStatus.HIGH_CONFIDENCE:
+            raise FrameQualityError(assess_frame_quality(frame.payload, resolved_frame_policy))
+
         span = estimator.estimate(frame)
         resolved_estimator_id = estimator_id or getattr(estimator, "provenance_id", None) or estimator.__class__.__name__
         resolved_quality_policy = quality_policy or getattr(estimator, "quality_policy", None) or DEFAULT_GEOMETRY_QUALITY_POLICY
         provenance = GeometryProvenance.from_span(span, resolved_estimator_id, resolved_quality_policy)
         if require_high_confidence and provenance.quality_status != GeometryQualityStatus.HIGH_CONFIDENCE:
             raise GeometryQualityError(assess_geometry(span, resolved_quality_policy))
-        return self._build_width_evidence(frame, float(span.span_px), target_width_in, warning_tolerance_in, fail_tolerance_in, geometry=provenance)
+        return self._build_width_evidence(frame, float(span.span_px), target_width_in, warning_tolerance_in, fail_tolerance_in, geometry=provenance, frame_quality=frame_provenance)
