@@ -140,15 +140,17 @@ class EvidenceService:
         """Capture one image, estimate its belt edges, and create width evidence.
 
         Automatic captures persist the exact left/right geometry and estimator
-        provenance used for the dimensional result. A caller may supply a stable
-        configured estimator ID; direct tests default to the estimator class name.
+        provenance used for the dimensional result. Configured estimators may expose
+        a stable ``provenance_id``; direct/custom estimators fall back to class name.
         """
         frame = self.camera.capture()
         span = estimator.estimate(frame)
-        provenance = GeometryProvenance.from_span(
-            span,
-            estimator_id or estimator.__class__.__name__,
+        resolved_estimator_id = (
+            estimator_id
+            or getattr(estimator, "provenance_id", None)
+            or estimator.__class__.__name__
         )
+        provenance = GeometryProvenance.from_span(span, resolved_estimator_id)
         return self._build_width_evidence(
             frame,
             float(span.span_px),
