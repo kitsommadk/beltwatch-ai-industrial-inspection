@@ -5,6 +5,7 @@ from app.camera import SimulatedCamera
 from app.database import initialize
 from app.evidence import EvidenceService
 from app.evidence_store import evidence_summary, initialize_evidence_store, list_evidence, save_evidence
+from app.temporal_quality import TemporalQualityPolicy, assess_temporal_width
 
 
 def _service():
@@ -22,11 +23,7 @@ def _service():
     )
 
 
-def test_persist_and_summarize_evidence(monkeypatch, tmp_path: Path):
-    monkeypatch.setenv("BELTWATCH_DB_PATH", str(tmp_path / "test.db"))
-    initialize()
-    initialize_evidence_store()
-
+def _session():
     from app.database import connect
     with connect() as con:
         cursor = con.execute(
@@ -34,7 +31,12 @@ def test_persist_and_summarize_evidence(monkeypatch, tmp_path: Path):
             tolerance_in, target_length_ft, footage_ft, current_width_in, status, updated_at)
             VALUES ('R1','WO1','tester',48,0.1,1000,0,48,'inspecting','now')"""
         )
-        session_id = cursor.lastrowid
+        return cursor.lastrowid
+
+
+def test_persist_and_summarize_evidence(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("BELTWATCH_DB_PATH", str(tmp_path / "test.db"))
+    initialize(); initialize_evidence_store(); session_id = _session()
 
     service = _service()
     first = service.capture_width(960, 48, 0.10, 0.20)
@@ -47,6 +49,7 @@ def test_persist_and_summarize_evidence(monkeypatch, tmp_path: Path):
     assert rows[0]["position_ft"] == 105
     assert rows[0]["frame_sequence"] == 2
     assert rows[1]["calibration_profile_id"] == "top-cal-v1"
+    assert rows[0]["temporal_status"] is None
 
     summary = evidence_summary(session_id)
     assert summary["total"] == 2
@@ -57,21 +60,35 @@ def test_persist_and_summarize_evidence(monkeypatch, tmp_path: Path):
     assert summary["max_width_in"] == 48.0
 
 
+def test_temporal_result_is_persisted_with_evidence(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("BELTWATCH_DB_PATH", str(tmp_path / "test.db"))
+    initialize(); initialize_evidence_store(); session_id = _session()
+
+    evidence = _service().capture_width(958, 48, 0.10, 0.20)
+    policy = TemporalQualityPolicy(policy_id="temporal-store-v1")
+    temporal = assess_temporal_width(
+        evidence.width.measured_width_in,
+        [48.0],
+        policy,
+        current_position_ft=evidence.position_ft,
+        history_positions_ft=[95.0],
+    )
+    saved = save_evidence(session_id, evidence, temporal=temporal)
+
+    assert saved["temporal_policy_id"] == "temporal-store-v1"
+    assert saved["temporal_status"] == temporal.status.value
+    assert saved["temporal_history_count"] == 1
+    assert saved["temporal_previous_position_ft"] == 95.0
+    assert saved["temporal_position_delta_ft"] == 5.0
+    assert saved["temporal_width_change_per_ft"] is not None
+    assert saved["temporal_reasons"] == list(temporal.reasons)
+
+
 def test_duplicate_frame_is_rejected(monkeypatch, tmp_path: Path):
     import sqlite3
 
     monkeypatch.setenv("BELTWATCH_DB_PATH", str(tmp_path / "test.db"))
-    initialize()
-    initialize_evidence_store()
-
-    from app.database import connect
-    with connect() as con:
-        cursor = con.execute(
-            """INSERT INTO sessions(roll_number, work_order, operator, target_width_in,
-            tolerance_in, target_length_ft, footage_ft, current_width_in, status, updated_at)
-            VALUES ('R1','WO1','tester',48,0.1,1000,0,48,'inspecting','now')"""
-        )
-        session_id = cursor.lastrowid
+    initialize(); initialize_evidence_store(); session_id = _session()
 
     evidence = _service().capture_width(960, 48, 0.10, 0.20)
     save_evidence(session_id, evidence)
