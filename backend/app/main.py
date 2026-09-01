@@ -62,7 +62,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="BeltWatch AI Pilot API",
     description="Local-first inspection workflow API with explicit simulation and replay validation modes.",
-    version="0.6.0",
+    version="0.7.0",
     lifespan=lifespan,
 )
 
@@ -144,8 +144,8 @@ def start_session(payload: SessionInput):
         con.execute(
             """INSERT INTO sessions(
                 roll_number, work_order, operator, target_width_in, tolerance_in,
-                target_length_ft, footage_ft, current_width_in, status, started_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'inspecting', ?, ?)""",
+                target_length_ft, footage_ft, current_width_in, status, started_at, updated_at, run_layout
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, 'inspecting', ?, ?, ?)""",
             (
                 payload.roll_number,
                 payload.work_order,
@@ -156,10 +156,15 @@ def start_session(payload: SessionInput):
                 payload.target_width_in,
                 timestamp,
                 timestamp,
+                payload.run_layout,
             ),
         )
         session = current_session(con)
-        audit(con, "session.started", f"session={session['id']} roll={payload.roll_number}")
+        audit(
+            con,
+            "session.started",
+            f"session={session['id']} roll={payload.roll_number} layout={payload.run_layout}",
+        )
         return row_dict(session)
 
 
