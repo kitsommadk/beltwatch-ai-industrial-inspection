@@ -1,6 +1,7 @@
 """SQLite persistence for traceable BeltWatch inspection evidence."""
 
 import json
+from dataclasses import dataclass
 
 from .database import connect
 from .evidence import InspectionEvidence
@@ -8,6 +9,13 @@ from .temporal_quality import TemporalQualityResult
 
 
 EVIDENCE_SCHEMA_VERSION = 9
+
+
+@dataclass(frozen=True)
+class EvidenceWrite:
+    evidence: InspectionEvidence
+    lane_id: str = "belt"
+    temporal: TemporalQualityResult | None = None
 
 
 def _geometry_columns(con) -> set[str]:
@@ -44,7 +52,6 @@ def _migrate_v6_to_v7(con) -> None:
 
 
 def _migrate_v7_to_v8(con) -> None:
-    """Rebuild evidence identity so one physical frame may contain multiple belt lanes."""
     con.execute("PRAGMA foreign_keys = OFF")
     try:
         con.execute("ALTER TABLE inspection_evidence RENAME TO inspection_evidence_v7")
@@ -70,25 +77,16 @@ def _migrate_v7_to_v8(con) -> None:
 
 def _create_temporal_table(con) -> None:
     con.execute("""CREATE TABLE IF NOT EXISTS inspection_temporal_quality (
-        evidence_id INTEGER PRIMARY KEY,
-        policy_id TEXT NOT NULL,
+        evidence_id INTEGER PRIMARY KEY, policy_id TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('insufficient-history','incomparable','high-confidence','degraded','invalid')),
-        history_count INTEGER NOT NULL CHECK(history_count>=0),
-        previous_width_in REAL,
-        history_median_width_in REAL,
-        step_change_in REAL,
-        median_deviation_in REAL,
-        previous_position_ft REAL,
-        position_delta_ft REAL,
-        width_change_per_ft REAL,
-        reasons_json TEXT NOT NULL,
-        FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE
-    )""")
+        history_count INTEGER NOT NULL CHECK(history_count>=0), previous_width_in REAL,
+        history_median_width_in REAL, step_change_in REAL, median_deviation_in REAL,
+        previous_position_ft REAL, position_delta_ft REAL, width_change_per_ft REAL, reasons_json TEXT NOT NULL,
+        FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE)""")
 
 
 def _migrate_v8_to_v9(con) -> None:
-    _create_temporal_table(con)
-    con.execute("UPDATE evidence_schema_metadata SET schema_version=9 WHERE singleton_id=1")
+    _create_temporal_table(con); con.execute("UPDATE evidence_schema_metadata SET schema_version=9 WHERE singleton_id=1")
 
 
 def initialize_evidence_store() -> None:
@@ -127,12 +125,10 @@ def initialize_evidence_store() -> None:
         if stored==6: _migrate_v6_to_v7(con); stored=7
         if stored==7: _migrate_v7_to_v8(con); stored=8
         if stored==8: _migrate_v8_to_v9(con); stored=9
-        if stored != EVIDENCE_SCHEMA_VERSION:
-            raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
+        if stored != EVIDENCE_SCHEMA_VERSION: raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
 
 
 def _decode_reasons(value): return None if value is None else list(json.loads(value))
-
 
 def _evidence_select() -> str:
     return """SELECT e.*, g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y AS geometry_row_y,g.threshold AS geometry_threshold,g.sampled_rows,
@@ -150,46 +146,46 @@ def _evidence_select() -> str:
     LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id
     LEFT JOIN inspection_temporal_quality tq ON tq.evidence_id=e.id"""
 
-
 def _decode_row(row):
-    result=dict(row)
-    result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json"))
-    result["frame_quality_reasons"]=_decode_reasons(result.pop("frame_quality_reasons_json"))
-    result["temporal_reasons"]=_decode_reasons(result.pop("temporal_reasons_json"))
-    return result
-
+    result=dict(row); result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json")); result["frame_quality_reasons"]=_decode_reasons(result.pop("frame_quality_reasons_json")); result["temporal_reasons"]=_decode_reasons(result.pop("temporal_reasons_json")); return result
 
 def _evidence_row(con,evidence_id): return con.execute(_evidence_select()+" WHERE e.id=?",(evidence_id,)).fetchone()
 
 
-def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt", temporal: TemporalQualityResult | None = None) -> dict:
-    if not lane_id.strip(): raise ValueError("lane_id must not be empty")
-    width=evidence.width
+def _insert_evidence(con, session_id: int, write: EvidenceWrite) -> int:
+    if not write.lane_id.strip(): raise ValueError("lane_id must not be empty")
+    evidence=write.evidence; width=evidence.width
+    cursor=con.execute("""INSERT INTO inspection_evidence(session_id,camera_id,frame_sequence,lane_id,captured_at,payload_ref,position_ft,position_source,
+    calibration_profile_id,calibration_version,measured_span_px,target_width_in,measured_width_in,deviation_in,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    (session_id,evidence.camera_id,evidence.frame_sequence,write.lane_id,evidence.captured_at.isoformat(),evidence.payload_ref,evidence.position_ft,evidence.position_source,
+    evidence.calibration_profile_id,evidence.calibration_version,evidence.measured_span_px,width.target_width_in,width.measured_width_in,width.absolute_deviation_in,width.status.value))
+    evidence_id=cursor.lastrowid
+    if evidence.geometry is not None:
+        g=evidence.geometry; con.execute("""INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,min_edge_sharpness,quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)))
+    if evidence.frame_quality is not None:
+        fq=evidence.frame_quality; con.execute("""INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)))
+    if write.temporal is not None:
+        t=write.temporal; con.execute("""INSERT INTO inspection_temporal_quality(evidence_id,policy_id,status,history_count,previous_width_in,history_median_width_in,step_change_in,median_deviation_in,previous_position_ft,position_delta_ft,width_change_per_ft,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (evidence_id,t.policy_id,t.status.value,t.history_count,t.previous_width_in,t.history_median_width_in,t.step_change_in,t.median_deviation_in,t.previous_position_ft,t.position_delta_ft,t.width_change_per_ft,json.dumps(t.reasons)))
+    return evidence_id
+
+
+def save_evidence_batch(session_id: int, writes: list[EvidenceWrite] | tuple[EvidenceWrite, ...]) -> list[dict]:
+    if not writes: raise ValueError("writes must not be empty")
     with connect() as con:
-        cursor=con.execute("""INSERT INTO inspection_evidence(session_id,camera_id,frame_sequence,lane_id,captured_at,payload_ref,position_ft,position_source,
-        calibration_profile_id,calibration_version,measured_span_px,target_width_in,measured_width_in,deviation_in,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (session_id,evidence.camera_id,evidence.frame_sequence,lane_id,evidence.captured_at.isoformat(),evidence.payload_ref,evidence.position_ft,evidence.position_source,
-        evidence.calibration_profile_id,evidence.calibration_version,evidence.measured_span_px,width.target_width_in,width.measured_width_in,width.absolute_deviation_in,width.status.value))
-        evidence_id=cursor.lastrowid
-        if evidence.geometry is not None:
-            g=evidence.geometry; con.execute("""INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,min_edge_contrast,min_edge_sharpness,quality_policy_id,quality_status,quality_reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,g.left_edge_spread_px,g.right_edge_spread_px,g.min_edge_contrast,g.min_edge_sharpness,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)))
-        if evidence.frame_quality is not None:
-            fq=evidence.frame_quality; con.execute("""INSERT INTO inspection_frame_quality(evidence_id,policy_id,status,sampled_pixels,mean_intensity,p05_intensity,p95_intensity,dynamic_range,low_clipped_fraction,high_clipped_fraction,reasons_json) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,fq.policy_id,fq.status.value,fq.sampled_pixels,fq.mean_intensity,fq.p05_intensity,fq.p95_intensity,fq.dynamic_range,fq.low_clipped_fraction,fq.high_clipped_fraction,json.dumps(fq.reasons)))
-        if temporal is not None:
-            con.execute("""INSERT INTO inspection_temporal_quality(evidence_id,policy_id,status,history_count,previous_width_in,history_median_width_in,
-            step_change_in,median_deviation_in,previous_position_ft,position_delta_ft,width_change_per_ft,reasons_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (evidence_id,temporal.policy_id,temporal.status.value,temporal.history_count,temporal.previous_width_in,temporal.history_median_width_in,
-             temporal.step_change_in,temporal.median_deviation_in,temporal.previous_position_ft,temporal.position_delta_ft,temporal.width_change_per_ft,json.dumps(temporal.reasons)))
-        return _decode_row(_evidence_row(con,evidence_id))
+        ids=[_insert_evidence(con,session_id,write) for write in writes]
+        return [_decode_row(_evidence_row(con,evidence_id)) for evidence_id in ids]
+
+
+def save_evidence(session_id: int, evidence: InspectionEvidence, *, lane_id: str = "belt", temporal: TemporalQualityResult | None = None) -> dict:
+    return save_evidence_batch(session_id,[EvidenceWrite(evidence,lane_id,temporal)])[0]
 
 
 def list_evidence(session_id:int,limit:int=250):
     if limit<1 or limit>1000: raise ValueError("limit must be between 1 and 1000")
-    with connect() as con:
-        return [_decode_row(r) for r in con.execute(_evidence_select()+" WHERE e.session_id=? ORDER BY e.position_ft DESC,e.id DESC LIMIT ?",(session_id,limit)).fetchall()]
+    with connect() as con: return [_decode_row(r) for r in con.execute(_evidence_select()+" WHERE e.session_id=? ORDER BY e.position_ft DESC,e.id DESC LIMIT ?",(session_id,limit)).fetchall()]
 
 
 def evidence_summary(session_id:int):
@@ -199,6 +195,4 @@ def evidence_summary(session_id:int):
         SUM(CASE WHEN g.quality_status='degraded' THEN 1 ELSE 0 END) degraded_geometry,SUM(CASE WHEN fq.status='high-confidence' THEN 1 ELSE 0 END) high_confidence_frame_quality,
         SUM(CASE WHEN fq.status='degraded' THEN 1 ELSE 0 END) degraded_frame_quality,MIN(e.measured_width_in) min_width_in,MAX(e.measured_width_in) max_width_in
         FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id LEFT JOIN inspection_frame_quality fq ON fq.evidence_id=e.id WHERE e.session_id=?""",(session_id,)).fetchone()
-        return {"total":row["total"] or 0,"pass":row["pass_count"] or 0,"warning":row["warning_count"] or 0,"fail":row["fail_count"] or 0,
-        "high_confidence_geometry":row["high_confidence_geometry"] or 0,"degraded_geometry":row["degraded_geometry"] or 0,"high_confidence_frame_quality":row["high_confidence_frame_quality"] or 0,
-        "degraded_frame_quality":row["degraded_frame_quality"] or 0,"min_width_in":row["min_width_in"],"max_width_in":row["max_width_in"]}
+        return {"total":row["total"] or 0,"pass":row["pass_count"] or 0,"warning":row["warning_count"] or 0,"fail":row["fail_count"] or 0,"high_confidence_geometry":row["high_confidence_geometry"] or 0,"degraded_geometry":row["degraded_geometry"] or 0,"high_confidence_frame_quality":row["high_confidence_frame_quality"] or 0,"degraded_frame_quality":row["degraded_frame_quality"] or 0,"min_width_in":row["min_width_in"],"max_width_in":row["max_width_in"]}

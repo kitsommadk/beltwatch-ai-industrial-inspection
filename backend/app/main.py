@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .database import connect, initialize
 from .detection import SimulatedDetector
-from .evidence_store import evidence_summary, initialize_evidence_store, list_evidence, save_evidence
+from .evidence_store import EvidenceWrite, evidence_summary, initialize_evidence_store, list_evidence, save_evidence, save_evidence_batch
 from .multilane_evidence import capture_two_lane_inspection_auto
 from .runtime import InspectionRuntime, RuntimeConfigurationError, build_runtime
 from .schemas import DetectionRequest, EvidenceAutoCaptureRequest, EvidenceCaptureRequest, EventReview, ProgressInput, SessionInput
@@ -37,7 +37,7 @@ def get_runtime()->InspectionRuntime:
 @asynccontextmanager
 async def lifespan(_app:FastAPI): initialize(); initialize_evidence_store(); yield
 
-app=FastAPI(title="BeltWatch AI Pilot API",description="Local-first inspection workflow API with explicit simulation and replay validation modes.",version="0.9.0",lifespan=lifespan)
+app=FastAPI(title="BeltWatch AI Pilot API",description="Local-first inspection workflow API with explicit simulation and replay validation modes.",version="0.9.1",lifespan=lifespan)
 origins=[x.strip() for x in os.getenv("BELTWATCH_ALLOWED_ORIGINS","http://localhost:5173").split(",")]
 app.add_middleware(CORSMiddleware,allow_origins=origins,allow_credentials=False,allow_methods=["GET","POST"],allow_headers=["Content-Type"])
 detector=SimulatedDetector()
@@ -128,9 +128,12 @@ def capture_evidence_auto(payload:EvidenceAutoCaptureRequest,runtime:InspectionR
         if set(ctx["lane_targets"])!={"belt-a","belt-b"}:raise RuntimeConfigurationError("slit-two-lane session is missing exact belt-a/b targets")
         service=runtime.two_lane_service_for(payload.camera); estimator=runtime.two_lane_estimator_for(payload.camera)
         capture=capture_two_lane_inspection_auto(service,estimator,ctx["lane_targets"],ctx["tolerance_in"],ctx["tolerance_in"]*2)
-        saved=[_persist_auto_evidence(ctx["session_id"],lane.evidence,lane_id=lane.lane_id,update_current_width=False) for lane in capture.lanes]
+        temporals={lane.lane_id:assess_evidence_temporally(ctx["session_id"],lane.lane_id,lane.evidence,TEMPORAL_POLICY) for lane in capture.lanes}
+        saved=save_evidence_batch(ctx["session_id"],[EvidenceWrite(lane.evidence,lane.lane_id,temporals[lane.lane_id]) for lane in capture.lanes])
         diagnostics=asdict(capture.diagnostics)
-        with connect() as con: audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b gap_px={diagnostics['gap_px']}")
+        with connect() as con:
+            for record in saved: audit(con,"evidence.captured",f"evidence={record['id']} lane={record['lane_id']} camera={record['camera_id']} position_ft={record['position_ft']} status={record['status']} temporal={record.get('temporal_status')}")
+            audit(con,"evidence.multilane_captured",f"session={ctx['session_id']} camera={payload.camera} frame={saved[0]['frame_sequence']} lanes=belt-a,belt-b gap_px={diagnostics['gap_px']}")
         return {"run_layout":"slit-two-lane","shared_frame_sequence":saved[0]["frame_sequence"],"shared_position_ft":saved[0]["position_ft"],"records":saved,"diagnostics":diagnostics}
     except (RuntimeConfigurationError,ValueError,RuntimeError,EOFError) as exc:raise HTTPException(422,str(exc)) from exc
 
