@@ -11,6 +11,13 @@ from datetime import datetime
 from .calibration import CalibrationProfile, PositionProvider
 from .camera import CameraProvider, FramePacket
 from .edge_span import BeltSpan, SpanEstimator
+from .geometry_quality import (
+    DEFAULT_GEOMETRY_QUALITY_POLICY,
+    GeometryQualityError,
+    GeometryQualityPolicy,
+    GeometryQualityStatus,
+    assess_geometry,
+)
 from .measurement import WidthMeasurement, WidthTolerance, measure_width_from_span
 
 
@@ -25,11 +32,20 @@ class GeometryProvenance:
     threshold: float
     sampled_rows: int
     span_spread_px: int
+    quality_policy_id: str
+    quality_status: GeometryQualityStatus
+    quality_reasons: tuple[str, ...]
 
     @classmethod
-    def from_span(cls, span: BeltSpan, estimator_id: str) -> "GeometryProvenance":
+    def from_span(
+        cls,
+        span: BeltSpan,
+        estimator_id: str,
+        quality_policy: GeometryQualityPolicy,
+    ) -> "GeometryProvenance":
         if not estimator_id.strip():
             raise ValueError("estimator_id must not be empty")
+        quality = assess_geometry(span, quality_policy)
         return cls(
             estimator_id=estimator_id,
             left_x=span.left_x,
@@ -38,6 +54,9 @@ class GeometryProvenance:
             threshold=span.threshold,
             sampled_rows=span.sampled_rows,
             span_spread_px=span.span_spread_px,
+            quality_policy_id=quality.policy_id,
+            quality_status=quality.status,
+            quality_reasons=quality.reasons,
         )
 
 
@@ -136,12 +155,15 @@ class EvidenceService:
         fail_tolerance_in: float,
         *,
         estimator_id: str | None = None,
+        quality_policy: GeometryQualityPolicy | None = None,
+        require_high_confidence: bool = True,
     ) -> InspectionEvidence:
-        """Capture one image, estimate its belt edges, and create width evidence.
+        """Capture an image, qualify its geometry, then create width evidence.
 
-        Automatic captures persist the exact left/right geometry and estimator
-        provenance used for the dimensional result. Configured estimators may expose
-        a stable ``provenance_id``; direct/custom estimators fall back to class name.
+        Geometry quality is evaluated before dimensional classification. By default,
+        degraded or invalid geometry fails closed so an ambiguous image cannot quietly
+        become a dimensional PASS. Callers may explicitly allow degraded evidence for
+        diagnostic workflows, but that is not the normal inspection path.
         """
         frame = self.camera.capture()
         span = estimator.estimate(frame)
@@ -150,7 +172,20 @@ class EvidenceService:
             or getattr(estimator, "provenance_id", None)
             or estimator.__class__.__name__
         )
-        provenance = GeometryProvenance.from_span(span, resolved_estimator_id)
+        resolved_quality_policy = (
+            quality_policy
+            or getattr(estimator, "quality_policy", None)
+            or DEFAULT_GEOMETRY_QUALITY_POLICY
+        )
+        provenance = GeometryProvenance.from_span(
+            span,
+            resolved_estimator_id,
+            resolved_quality_policy,
+        )
+        if require_high_confidence and provenance.quality_status != GeometryQualityStatus.HIGH_CONFIDENCE:
+            raise GeometryQualityError(
+                assess_geometry(span, resolved_quality_policy)
+            )
         return self._build_width_evidence(
             frame,
             float(span.span_px),

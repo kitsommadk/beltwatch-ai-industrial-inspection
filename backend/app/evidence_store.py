@@ -1,17 +1,39 @@
 """SQLite persistence for traceable BeltWatch inspection evidence."""
 
+import json
+
 from .database import connect
 from .evidence import InspectionEvidence
 
 
-EVIDENCE_SCHEMA_VERSION = 2
+EVIDENCE_SCHEMA_VERSION = 3
+
+
+def _geometry_columns(con) -> set[str]:
+    return {row["name"] for row in con.execute("PRAGMA table_info(inspection_geometry)").fetchall()}
+
+
+def _migrate_v2_to_v3(con) -> None:
+    """Add geometry-quality provenance without rewriting dimensional evidence."""
+    columns = _geometry_columns(con)
+    if "quality_policy_id" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_policy_id TEXT")
+    if "quality_status" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_status TEXT")
+    if "quality_reasons_json" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_reasons_json TEXT")
+    con.execute(
+        "UPDATE evidence_schema_metadata SET schema_version=? WHERE singleton_id=1",
+        (EVIDENCE_SCHEMA_VERSION,),
+    )
 
 
 def initialize_evidence_store() -> None:
-    """Create additive evidence tables and record the evidence-store schema version.
+    """Create evidence tables and apply the supported additive evidence migration.
 
-    Version 2 adds a one-to-one geometry-provenance table without rewriting existing
-    dimensional evidence. Existing rows remain valid and simply have no geometry row.
+    Version 3 adds geometry-quality policy/status/reasons. A version-2 store can be
+    migrated additively because existing geometry remains valid but has unknown
+    historical quality. Unknown schema versions still fail closed.
     """
     with connect() as con:
         con.executescript(
@@ -50,6 +72,9 @@ def initialize_evidence_store() -> None:
                 threshold REAL NOT NULL,
                 sampled_rows INTEGER NOT NULL,
                 span_spread_px INTEGER NOT NULL,
+                quality_policy_id TEXT,
+                quality_status TEXT,
+                quality_reasons_json TEXT,
                 FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE,
                 CHECK(right_x_exclusive > left_x),
                 CHECK(sampled_rows > 0),
@@ -67,6 +92,9 @@ def initialize_evidence_store() -> None:
         stored = con.execute(
             "SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1"
         ).fetchone()[0]
+        if stored == 2:
+            _migrate_v2_to_v3(con)
+            stored = EVIDENCE_SCHEMA_VERSION
         if stored != EVIDENCE_SCHEMA_VERSION:
             raise RuntimeError(
                 f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; "
@@ -109,8 +137,9 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
                 """
                 INSERT INTO inspection_geometry(
                     evidence_id, estimator_id, left_x, right_x_exclusive, row_y,
-                    threshold, sampled_rows, span_spread_px
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    threshold, sampled_rows, span_spread_px, quality_policy_id,
+                    quality_status, quality_reasons_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     evidence_id,
@@ -121,10 +150,22 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
                     geometry.threshold,
                     geometry.sampled_rows,
                     geometry.span_spread_px,
+                    geometry.quality_policy_id,
+                    geometry.quality_status.value,
+                    json.dumps(geometry.quality_reasons),
                 ),
             )
         row = _evidence_row(con, evidence_id)
-        return dict(row)
+        result = dict(row)
+        result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
+        return result
+
+
+def _decode_reasons(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    decoded = json.loads(value)
+    return list(decoded)
 
 
 def _evidence_row(con, evidence_id: int):
@@ -137,7 +178,10 @@ def _evidence_row(con, evidence_id: int):
                g.row_y AS geometry_row_y,
                g.threshold AS geometry_threshold,
                g.sampled_rows,
-               g.span_spread_px
+               g.span_spread_px,
+               g.quality_policy_id,
+               g.quality_status,
+               g.quality_reasons_json
         FROM inspection_evidence e
         LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
         WHERE e.id=?
@@ -159,7 +203,10 @@ def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
                    g.row_y AS geometry_row_y,
                    g.threshold AS geometry_threshold,
                    g.sampled_rows,
-                   g.span_spread_px
+                   g.span_spread_px,
+                   g.quality_policy_id,
+                   g.quality_status,
+                   g.quality_reasons_json
             FROM inspection_evidence e
             LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
             WHERE e.session_id=?
@@ -167,7 +214,12 @@ def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
             """,
             (session_id, limit),
         ).fetchall()
-        return [dict(row) for row in rows]
+        results: list[dict] = []
+        for row in rows:
+            result = dict(row)
+            result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
+            results.append(result)
+        return results
 
 
 def evidence_summary(session_id: int) -> dict:
@@ -175,12 +227,16 @@ def evidence_summary(session_id: int) -> dict:
         row = con.execute(
             """
             SELECT COUNT(*) total,
-                   SUM(CASE WHEN status='PASS' THEN 1 ELSE 0 END) pass_count,
-                   SUM(CASE WHEN status='WARNING' THEN 1 ELSE 0 END) warning_count,
-                   SUM(CASE WHEN status='FAIL' THEN 1 ELSE 0 END) fail_count,
-                   MIN(measured_width_in) min_width_in,
-                   MAX(measured_width_in) max_width_in
-            FROM inspection_evidence WHERE session_id=?
+                   SUM(CASE WHEN e.status='PASS' THEN 1 ELSE 0 END) pass_count,
+                   SUM(CASE WHEN e.status='WARNING' THEN 1 ELSE 0 END) warning_count,
+                   SUM(CASE WHEN e.status='FAIL' THEN 1 ELSE 0 END) fail_count,
+                   SUM(CASE WHEN g.quality_status='high-confidence' THEN 1 ELSE 0 END) high_confidence_geometry,
+                   SUM(CASE WHEN g.quality_status='degraded' THEN 1 ELSE 0 END) degraded_geometry,
+                   MIN(e.measured_width_in) min_width_in,
+                   MAX(e.measured_width_in) max_width_in
+            FROM inspection_evidence e
+            LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+            WHERE e.session_id=?
             """,
             (session_id,),
         ).fetchone()
@@ -189,6 +245,8 @@ def evidence_summary(session_id: int) -> dict:
             "pass": row["pass_count"] or 0,
             "warning": row["warning_count"] or 0,
             "fail": row["fail_count"] or 0,
+            "high_confidence_geometry": row["high_confidence_geometry"] or 0,
+            "degraded_geometry": row["degraded_geometry"] or 0,
             "min_width_in": row["min_width_in"],
             "max_width_in": row["max_width_in"],
         }
