@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 SessionStatus = Literal["ready", "inspecting", "paused", "complete"]
@@ -16,6 +16,19 @@ class SessionInput(BaseModel):
     tolerance_in: float = Field(gt=0, le=2)
     target_length_ft: float = Field(gt=0, le=100_000)
     run_layout: RunLayoutInput = "single"
+    lane_targets: dict[Literal["belt-a", "belt-b"], float] | None = None
+
+    @model_validator(mode="after")
+    def validate_lane_targets(self):
+        if self.run_layout == "single":
+            if self.lane_targets is not None:
+                raise ValueError("single-belt sessions must not provide slit lane targets")
+            return self
+        if self.lane_targets is None or set(self.lane_targets) != {"belt-a", "belt-b"}:
+            raise ValueError("slit-two-lane sessions require exactly belt-a and belt-b target widths")
+        if any(width <= 0 or width > 120 for width in self.lane_targets.values()):
+            raise ValueError("lane target widths must be greater than 0 and at most 120 inches")
+        return self
 
 
 class ProgressInput(BaseModel):
@@ -34,12 +47,10 @@ class DetectionRequest(BaseModel):
 
 class EvidenceCaptureRequest(BaseModel):
     """Development compatibility input where the caller supplies pixel span."""
-
     camera: Literal["top", "bottom"]
     measured_span_px: float = Field(gt=0, le=20_000)
 
 
 class EvidenceAutoCaptureRequest(BaseModel):
     """Automatic image-driven capture request for replay/live-image providers."""
-
     camera: Literal["top", "bottom"]
