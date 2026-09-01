@@ -51,12 +51,11 @@ def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, t
     initialize_evidence_store()
 
     with connect() as con:
-        version = con.execute(
-            "SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1"
-        ).fetchone()[0]
+        version = con.execute("SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1").fetchone()[0]
         columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_geometry)")}
+        frame_quality_columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_frame_quality)")}
 
-    assert version == EVIDENCE_SCHEMA_VERSION == 6
+    assert version == EVIDENCE_SCHEMA_VERSION == 7
     assert {
         "quality_policy_id",
         "quality_status",
@@ -66,3 +65,15 @@ def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, t
         "min_edge_contrast",
         "min_edge_sharpness",
     } <= columns
+    assert {
+        "policy_id",
+        "status",
+        "sampled_pixels",
+        "mean_intensity",
+        "p05_intensity",
+        "p95_intensity",
+        "dynamic_range",
+        "low_clipped_fraction",
+        "high_clipped_fraction",
+        "reasons_json",
+    } <= frame_quality_columns

@@ -12,6 +12,7 @@ from .calibration import SimulatedPositionProvider, make_calibration_profile
 from .camera import SimulatedCamera
 from .edge_span import MultiRowDarkEstimator, SpanEstimator
 from .evidence import EvidenceService
+from .frame_quality import FrameQualityPolicy
 from .geometry_quality import GeometryQualityPolicy
 from .replay import ReplayCamera, ReplayFrame
 
@@ -89,6 +90,13 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
             camera = ReplayCamera(camera_id, _replay_frames(camera_id), loop=False)
             estimator = MultiRowDarkEstimator(threshold=100, min_run_px=100, max_span_spread_px=12)
             estimator.provenance_id = "multirow-dark-v1"
+            estimator.frame_quality_policy = FrameQualityPolicy(
+                policy_id="replay-frame-quality-v1",
+                high_confidence_min_dynamic_range=80.0,
+                valid_min_dynamic_range=30.0,
+                high_confidence_max_clipped_fraction=0.01,
+                valid_max_clipped_fraction=0.10,
+            )
             estimator.quality_policy = GeometryQualityPolicy(
                 policy_id="replay-multirow-quality-v4",
                 high_confidence_min_rows=5,
