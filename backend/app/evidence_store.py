@@ -1,7 +1,5 @@
 """SQLite persistence for traceable BeltWatch inspection evidence."""
 
-from dataclasses import asdict
-
 from .database import connect
 from .evidence import InspectionEvidence
 
@@ -61,7 +59,7 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
                 evidence.measured_span_px,
                 width.target_width_in,
                 width.measured_width_in,
-                width.deviation_in,
+                width.absolute_deviation_in,
                 width.status.value,
             ),
         )
