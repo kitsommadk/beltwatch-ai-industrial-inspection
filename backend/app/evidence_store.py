@@ -6,7 +6,7 @@ from .database import connect
 from .evidence import InspectionEvidence
 
 
-EVIDENCE_SCHEMA_VERSION = 3
+EVIDENCE_SCHEMA_VERSION = 4
 
 
 def _geometry_columns(con) -> set[str]:
@@ -14,7 +14,6 @@ def _geometry_columns(con) -> set[str]:
 
 
 def _migrate_v2_to_v3(con) -> None:
-    """Add geometry-quality provenance without rewriting dimensional evidence."""
     columns = _geometry_columns(con)
     if "quality_policy_id" not in columns:
         con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_policy_id TEXT")
@@ -22,19 +21,19 @@ def _migrate_v2_to_v3(con) -> None:
         con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_status TEXT")
     if "quality_reasons_json" not in columns:
         con.execute("ALTER TABLE inspection_geometry ADD COLUMN quality_reasons_json TEXT")
-    con.execute(
-        "UPDATE evidence_schema_metadata SET schema_version=? WHERE singleton_id=1",
-        (EVIDENCE_SCHEMA_VERSION,),
-    )
+    con.execute("UPDATE evidence_schema_metadata SET schema_version=3 WHERE singleton_id=1")
+
+
+def _migrate_v3_to_v4(con) -> None:
+    columns = _geometry_columns(con)
+    if "left_edge_spread_px" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN left_edge_spread_px INTEGER")
+    if "right_edge_spread_px" not in columns:
+        con.execute("ALTER TABLE inspection_geometry ADD COLUMN right_edge_spread_px INTEGER")
+    con.execute("UPDATE evidence_schema_metadata SET schema_version=4 WHERE singleton_id=1")
 
 
 def initialize_evidence_store() -> None:
-    """Create evidence tables and apply the supported additive evidence migration.
-
-    Version 3 adds geometry-quality policy/status/reasons. A version-2 store can be
-    migrated additively because existing geometry remains valid but has unknown
-    historical quality. Unknown schema versions still fail closed.
-    """
     with connect() as con:
         con.executescript(
             """
@@ -57,12 +56,10 @@ def initialize_evidence_store() -> None:
                 FOREIGN KEY(session_id) REFERENCES sessions(id),
                 UNIQUE(session_id, camera_id, frame_sequence)
             );
-
             CREATE TABLE IF NOT EXISTS evidence_schema_metadata (
                 singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
                 schema_version INTEGER NOT NULL CHECK(schema_version > 0)
             );
-
             CREATE TABLE IF NOT EXISTS inspection_geometry (
                 evidence_id INTEGER PRIMARY KEY,
                 estimator_id TEXT NOT NULL,
@@ -72,6 +69,8 @@ def initialize_evidence_store() -> None:
                 threshold REAL NOT NULL,
                 sampled_rows INTEGER NOT NULL,
                 span_spread_px INTEGER NOT NULL,
+                left_edge_spread_px INTEGER,
+                right_edge_spread_px INTEGER,
                 quality_policy_id TEXT,
                 quality_status TEXT,
                 quality_reasons_json TEXT,
@@ -80,114 +79,60 @@ def initialize_evidence_store() -> None:
                 CHECK(sampled_rows > 0),
                 CHECK(span_spread_px >= 0)
             );
-
-            CREATE INDEX IF NOT EXISTS idx_evidence_session_position
-                ON inspection_evidence(session_id, position_ft);
+            CREATE INDEX IF NOT EXISTS idx_evidence_session_position ON inspection_evidence(session_id, position_ft);
             """
         )
-        con.execute(
-            "INSERT OR IGNORE INTO evidence_schema_metadata(singleton_id, schema_version) VALUES (1, ?)",
-            (EVIDENCE_SCHEMA_VERSION,),
-        )
-        stored = con.execute(
-            "SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1"
-        ).fetchone()[0]
+        con.execute("INSERT OR IGNORE INTO evidence_schema_metadata(singleton_id, schema_version) VALUES (1, ?)", (EVIDENCE_SCHEMA_VERSION,))
+        stored = con.execute("SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1").fetchone()[0]
         if stored == 2:
             _migrate_v2_to_v3(con)
-            stored = EVIDENCE_SCHEMA_VERSION
+            stored = 3
+        if stored == 3:
+            _migrate_v3_to_v4(con)
+            stored = 4
         if stored != EVIDENCE_SCHEMA_VERSION:
-            raise RuntimeError(
-                f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; "
-                "explicit evidence migration is required"
-            )
+            raise RuntimeError(f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; explicit evidence migration is required")
+
+
+def _decode_reasons(value: str | None) -> list[str] | None:
+    return None if value is None else list(json.loads(value))
+
+
+def _evidence_row(con, evidence_id: int):
+    return con.execute(
+        """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
+        g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
+        g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px,
+        g.quality_policy_id, g.quality_status, g.quality_reasons_json
+        FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+        WHERE e.id=?""", (evidence_id,)
+    ).fetchone()
 
 
 def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
     width = evidence.width
     with connect() as con:
         cursor = con.execute(
-            """
-            INSERT INTO inspection_evidence(
-                session_id, camera_id, frame_sequence, captured_at, payload_ref,
-                position_ft, position_source, calibration_profile_id, calibration_version,
-                measured_span_px, target_width_in, measured_width_in, deviation_in, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id,
-                evidence.camera_id,
-                evidence.frame_sequence,
-                evidence.captured_at.isoformat(),
-                evidence.payload_ref,
-                evidence.position_ft,
-                evidence.position_source,
-                evidence.calibration_profile_id,
-                evidence.calibration_version,
-                evidence.measured_span_px,
-                width.target_width_in,
-                width.measured_width_in,
-                width.absolute_deviation_in,
-                width.status.value,
-            ),
+            """INSERT INTO inspection_evidence(session_id,camera_id,frame_sequence,captured_at,payload_ref,
+            position_ft,position_source,calibration_profile_id,calibration_version,measured_span_px,
+            target_width_in,measured_width_in,deviation_in,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (session_id,evidence.camera_id,evidence.frame_sequence,evidence.captured_at.isoformat(),evidence.payload_ref,
+             evidence.position_ft,evidence.position_source,evidence.calibration_profile_id,evidence.calibration_version,
+             evidence.measured_span_px,width.target_width_in,width.measured_width_in,width.absolute_deviation_in,width.status.value),
         )
         evidence_id = cursor.lastrowid
         if evidence.geometry is not None:
-            geometry = evidence.geometry
+            g = evidence.geometry
             con.execute(
-                """
-                INSERT INTO inspection_geometry(
-                    evidence_id, estimator_id, left_x, right_x_exclusive, row_y,
-                    threshold, sampled_rows, span_spread_px, quality_policy_id,
-                    quality_status, quality_reasons_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    evidence_id,
-                    geometry.estimator_id,
-                    geometry.left_x,
-                    geometry.right_x_exclusive,
-                    geometry.row_y,
-                    geometry.threshold,
-                    geometry.sampled_rows,
-                    geometry.span_spread_px,
-                    geometry.quality_policy_id,
-                    geometry.quality_status.value,
-                    json.dumps(geometry.quality_reasons),
-                ),
+                """INSERT INTO inspection_geometry(evidence_id,estimator_id,left_x,right_x_exclusive,row_y,threshold,
+                sampled_rows,span_spread_px,left_edge_spread_px,right_edge_spread_px,quality_policy_id,quality_status,quality_reasons_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (evidence_id,g.estimator_id,g.left_x,g.right_x_exclusive,g.row_y,g.threshold,g.sampled_rows,g.span_spread_px,
+                 g.left_edge_spread_px,g.right_edge_spread_px,g.quality_policy_id,g.quality_status.value,json.dumps(g.quality_reasons)),
             )
-        row = _evidence_row(con, evidence_id)
-        result = dict(row)
+        result = dict(_evidence_row(con, evidence_id))
         result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
         return result
-
-
-def _decode_reasons(value: str | None) -> list[str] | None:
-    if value is None:
-        return None
-    decoded = json.loads(value)
-    return list(decoded)
-
-
-def _evidence_row(con, evidence_id: int):
-    return con.execute(
-        """
-        SELECT e.*,
-               g.estimator_id,
-               g.left_x,
-               g.right_x_exclusive,
-               g.row_y AS geometry_row_y,
-               g.threshold AS geometry_threshold,
-               g.sampled_rows,
-               g.span_spread_px,
-               g.quality_policy_id,
-               g.quality_status,
-               g.quality_reasons_json
-        FROM inspection_evidence e
-        LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-        WHERE e.id=?
-        """,
-        (evidence_id,),
-    ).fetchone()
 
 
 def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
@@ -195,58 +140,33 @@ def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
         raise ValueError("limit must be between 1 and 1000")
     with connect() as con:
         rows = con.execute(
-            """
-            SELECT e.*,
-                   g.estimator_id,
-                   g.left_x,
-                   g.right_x_exclusive,
-                   g.row_y AS geometry_row_y,
-                   g.threshold AS geometry_threshold,
-                   g.sampled_rows,
-                   g.span_spread_px,
-                   g.quality_policy_id,
-                   g.quality_status,
-                   g.quality_reasons_json
-            FROM inspection_evidence e
-            LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-            WHERE e.session_id=?
-            ORDER BY e.position_ft DESC, e.id DESC LIMIT ?
-            """,
-            (session_id, limit),
+            """SELECT e.*, g.estimator_id, g.left_x, g.right_x_exclusive,
+            g.row_y AS geometry_row_y, g.threshold AS geometry_threshold, g.sampled_rows,
+            g.span_spread_px, g.left_edge_spread_px, g.right_edge_spread_px,
+            g.quality_policy_id, g.quality_status, g.quality_reasons_json
+            FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+            WHERE e.session_id=? ORDER BY e.position_ft DESC, e.id DESC LIMIT ?""", (session_id, limit)
         ).fetchall()
-        results: list[dict] = []
+        results=[]
         for row in rows:
-            result = dict(row)
-            result["quality_reasons"] = _decode_reasons(result.pop("quality_reasons_json"))
+            result=dict(row)
+            result["quality_reasons"]=_decode_reasons(result.pop("quality_reasons_json"))
             results.append(result)
         return results
 
 
 def evidence_summary(session_id: int) -> dict:
     with connect() as con:
-        row = con.execute(
-            """
-            SELECT COUNT(*) total,
-                   SUM(CASE WHEN e.status='PASS' THEN 1 ELSE 0 END) pass_count,
-                   SUM(CASE WHEN e.status='WARNING' THEN 1 ELSE 0 END) warning_count,
-                   SUM(CASE WHEN e.status='FAIL' THEN 1 ELSE 0 END) fail_count,
-                   SUM(CASE WHEN g.quality_status='high-confidence' THEN 1 ELSE 0 END) high_confidence_geometry,
-                   SUM(CASE WHEN g.quality_status='degraded' THEN 1 ELSE 0 END) degraded_geometry,
-                   MIN(e.measured_width_in) min_width_in,
-                   MAX(e.measured_width_in) max_width_in
-            FROM inspection_evidence e
-            LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
-            WHERE e.session_id=?
-            """,
-            (session_id,),
+        row=con.execute(
+            """SELECT COUNT(*) total,
+            SUM(CASE WHEN e.status='PASS' THEN 1 ELSE 0 END) pass_count,
+            SUM(CASE WHEN e.status='WARNING' THEN 1 ELSE 0 END) warning_count,
+            SUM(CASE WHEN e.status='FAIL' THEN 1 ELSE 0 END) fail_count,
+            SUM(CASE WHEN g.quality_status='high-confidence' THEN 1 ELSE 0 END) high_confidence_geometry,
+            SUM(CASE WHEN g.quality_status='degraded' THEN 1 ELSE 0 END) degraded_geometry,
+            MIN(e.measured_width_in) min_width_in, MAX(e.measured_width_in) max_width_in
+            FROM inspection_evidence e LEFT JOIN inspection_geometry g ON g.evidence_id=e.id WHERE e.session_id=?""", (session_id,)
         ).fetchone()
-        return {
-            "total": row["total"] or 0,
-            "pass": row["pass_count"] or 0,
-            "warning": row["warning_count"] or 0,
-            "fail": row["fail_count"] or 0,
-            "high_confidence_geometry": row["high_confidence_geometry"] or 0,
-            "degraded_geometry": row["degraded_geometry"] or 0,
-            "min_width_in": row["min_width_in"],
-            "max_width_in": row["max_width_in"],
-        }
+        return {"total":row["total"] or 0,"pass":row["pass_count"] or 0,"warning":row["warning_count"] or 0,
+                "fail":row["fail_count"] or 0,"high_confidence_geometry":row["high_confidence_geometry"] or 0,
+                "degraded_geometry":row["degraded_geometry"] or 0,"min_width_in":row["min_width_in"],"max_width_in":row["max_width_in"]}

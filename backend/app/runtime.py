@@ -36,17 +36,10 @@ class InspectionRuntime:
         try:
             return self.span_estimators[camera_id]
         except KeyError as exc:
-            raise RuntimeConfigurationError(
-                f"automatic span estimation is not configured for camera {camera_id!r} in {self.mode!r} mode"
-            ) from exc
+            raise RuntimeConfigurationError(f"automatic span estimation is not configured for camera {camera_id!r} in {self.mode!r} mode") from exc
 
 
 def _make_replay_image(*, width_px: int, height_px: int, left_x: int, span_px: int) -> tuple[tuple[int, ...], ...]:
-    """Create a compact deterministic grayscale fixture without NumPy.
-
-    Rows are shared immutable tuples, so the replay payload stays lightweight while
-    still exercising the same image-indexing contract as real arrays.
-    """
     if width_px <= 0 or height_px <= 0 or span_px <= 0:
         raise ValueError("replay image dimensions must be greater than zero")
     right_x = left_x + span_px
@@ -57,30 +50,20 @@ def _make_replay_image(*, width_px: int, height_px: int, left_x: int, span_px: i
 
 
 def _replay_frames(camera_id: str) -> tuple[ReplayFrame, ...]:
-    """Return a finite, deterministic hardware-free geometry sequence."""
     spans = (960, 958, 962, 960, 956, 964)
     lefts = (120, 121, 119, 120, 122, 118)
-    frames: list[ReplayFrame] = []
-    for index, (left_x, span_px) in enumerate(zip(lefts, spans), start=1):
-        frames.append(
-            ReplayFrame(
-                source_ref=f"generated/{camera_id}/frame-{index:03d}",
-                width_px=1200,
-                height_px=120,
-                payload=_make_replay_image(
-                    width_px=1200,
-                    height_px=120,
-                    left_x=left_x,
-                    span_px=span_px,
-                ),
-            )
+    return tuple(
+        ReplayFrame(
+            source_ref=f"generated/{camera_id}/frame-{index:03d}",
+            width_px=1200,
+            height_px=120,
+            payload=_make_replay_image(width_px=1200, height_px=120, left_x=left_x, span_px=span_px),
         )
-    return tuple(frames)
+        for index, (left_x, span_px) in enumerate(zip(lefts, spans), start=1)
+    )
 
 
 def _calibration(camera_id: str, mode: str):
-    # Development calibration only: 20 px/in. Physical pilot calibration must
-    # replace these profiles before dimensional results are considered validated.
     return make_calibration_profile(
         profile_id=f"{camera_id}-{mode}-v1",
         camera_id=camera_id,
@@ -93,9 +76,7 @@ def _calibration(camera_id: str, mode: str):
 def build_runtime(mode: str | None = None) -> InspectionRuntime:
     selected = (mode or os.getenv("BELTWATCH_INSPECTION_MODE", "simulation")).strip().lower()
     if selected not in {"simulation", "replay"}:
-        raise RuntimeConfigurationError(
-            f"inspection mode {selected!r} is not available in this build; refusing simulated fallback"
-        )
+        raise RuntimeConfigurationError(f"inspection mode {selected!r} is not available in this build; refusing simulated fallback")
 
     services: dict[str, EvidenceService] = {}
     estimators: dict[str, SpanEstimator] = {}
@@ -106,26 +87,18 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
             camera = SimulatedCamera(camera_id)
         else:
             camera = ReplayCamera(camera_id, _replay_frames(camera_id), loop=False)
-            estimator = MultiRowDarkEstimator(
-                threshold=100,
-                min_run_px=100,
-                max_span_spread_px=12,
-            )
-            # Stable evidence provenance and quality policy for this configured
-            # algorithm contract. These are software-validation thresholds only.
+            estimator = MultiRowDarkEstimator(threshold=100, min_run_px=100, max_span_spread_px=12)
             estimator.provenance_id = "multirow-dark-v1"
             estimator.quality_policy = GeometryQualityPolicy(
-                policy_id="replay-multirow-quality-v1",
+                policy_id="replay-multirow-quality-v2",
                 high_confidence_min_rows=5,
                 valid_min_rows=3,
                 high_confidence_max_span_spread_px=2,
                 valid_max_span_spread_px=12,
+                high_confidence_max_edge_spread_px=2,
+                valid_max_edge_spread_px=12,
             )
             estimators[camera_id] = estimator
         services[camera_id] = EvidenceService(camera, position, calibration)
 
-    return InspectionRuntime(
-        mode=selected,
-        evidence_services=services,
-        span_estimators=estimators,
-    )
+    return InspectionRuntime(mode=selected, evidence_services=services, span_estimators=estimators)

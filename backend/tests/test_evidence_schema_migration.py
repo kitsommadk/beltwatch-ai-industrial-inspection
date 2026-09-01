@@ -4,7 +4,7 @@ from app.database import connect, initialize
 from app.evidence_store import EVIDENCE_SCHEMA_VERSION, initialize_evidence_store
 
 
-def test_v2_evidence_store_migrates_additively_to_v3(monkeypatch, tmp_path: Path):
+def test_v2_evidence_store_migrates_additively_to_current_version(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("BELTWATCH_DB_PATH", str(tmp_path / "migration.db"))
     initialize()
     with connect() as con:
@@ -56,5 +56,11 @@ def test_v2_evidence_store_migrates_additively_to_v3(monkeypatch, tmp_path: Path
         ).fetchone()[0]
         columns = {row["name"] for row in con.execute("PRAGMA table_info(inspection_geometry)")}
 
-    assert version == EVIDENCE_SCHEMA_VERSION == 3
-    assert {"quality_policy_id", "quality_status", "quality_reasons_json"} <= columns
+    assert version == EVIDENCE_SCHEMA_VERSION == 4
+    assert {
+        "quality_policy_id",
+        "quality_status",
+        "quality_reasons_json",
+        "left_edge_spread_px",
+        "right_edge_spread_px",
+    } <= columns
