@@ -18,10 +18,15 @@ export const api = {
   session: () => request("/session"),
   events: () => request("/events"),
   summary: () => request("/summary"),
+  evidence: (limit = 100) => request(`/evidence?limit=${limit}`),
+  evidenceSummary: () => request("/evidence/summary"),
+  captureEvidence: (camera, measured_span_px) => request("/evidence/capture", {
+    method: "POST",
+    body: JSON.stringify({ camera, measured_span_px }),
+  }),
   start: (data) => request("/session/start", { method: "POST", body: JSON.stringify(data) }),
   pause: () => request("/session/pause", { method: "POST" }),
   progress: (delta_ft = 12) => request("/session/progress", { method: "POST", body: JSON.stringify({ delta_ft }) }),
   detect: (kind) => request("/events/simulate", { method: "POST", body: JSON.stringify({ kind }) }),
   review: (id, status, note = "") => request(`/events/${id}/review`, { method: "POST", body: JSON.stringify({ status, note }) }),
 };
-
