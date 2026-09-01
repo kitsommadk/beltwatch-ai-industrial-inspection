@@ -1,12 +1,12 @@
 """Hardware-independent belt edge-span estimation.
 
-This first estimator intentionally uses a simple scanline/contrast contract so it
-can be validated with generated fixtures before introducing more complex OpenCV
-segmentation. It is a development baseline, not production-validated metrology.
+These estimators are deterministic development baselines for replay and generated
+fixture validation. They are not production-validated metrology.
 """
 
 from dataclasses import dataclass
 from numbers import Number
+from statistics import median
 from typing import Any, Protocol
 
 from .camera import FramePacket
@@ -19,6 +19,8 @@ class BeltSpan:
     span_px: int
     row_y: int
     threshold: float
+    sampled_rows: int = 1
+    span_spread_px: int = 0
 
 
 class SpanEstimator(Protocol):
@@ -94,7 +96,7 @@ def estimate_dark_belt_span(
 
 
 class DarkScanlineEstimator:
-    """Callable provider for deterministic replay/fixture validation."""
+    """Single-row reference estimator for deterministic replay validation."""
 
     def __init__(self, *, row_fraction: float = 0.5, threshold: float = 100.0, min_run_px: int = 20) -> None:
         self.row_fraction = row_fraction
@@ -113,3 +115,84 @@ class DarkScanlineEstimator:
         if span.right_x_exclusive > frame.width_px:
             raise ValueError("estimated span exceeds declared frame width")
         return span
+
+
+class MultiRowDarkEstimator:
+    """Aggregate several horizontal scanlines to reduce single-row sensitivity.
+
+    Each row is estimated independently. The final left/right edges are the medians
+    of the valid row estimates. span_spread_px records the range between the
+    narrowest and widest valid row, which provides a simple geometry-consistency
+    signal for replay benchmarking.
+    """
+
+    def __init__(
+        self,
+        *,
+        row_fractions: tuple[float, ...] = (0.25, 0.375, 0.5, 0.625, 0.75),
+        threshold: float = 100.0,
+        min_run_px: int = 20,
+        min_valid_rows: int = 3,
+        max_span_spread_px: int | None = 12,
+    ) -> None:
+        if not row_fractions:
+            raise ValueError("row_fractions must not be empty")
+        if any(not 0 <= row <= 1 for row in row_fractions):
+            raise ValueError("row fractions must be between 0 and 1")
+        if min_valid_rows <= 0 or min_valid_rows > len(row_fractions):
+            raise ValueError("min_valid_rows must fit within row_fractions")
+        if max_span_spread_px is not None and max_span_spread_px < 0:
+            raise ValueError("max_span_spread_px must be zero or greater")
+
+        self.row_fractions = row_fractions
+        self.threshold = threshold
+        self.min_run_px = min_run_px
+        self.min_valid_rows = min_valid_rows
+        self.max_span_spread_px = max_span_spread_px
+
+    def estimate(self, frame: FramePacket) -> BeltSpan:
+        if frame.payload is None:
+            raise ValueError("frame has no image payload for edge estimation")
+
+        spans: list[BeltSpan] = []
+        for row_fraction in self.row_fractions:
+            try:
+                spans.append(
+                    estimate_dark_belt_span(
+                        frame.payload,
+                        row_fraction=row_fraction,
+                        threshold=self.threshold,
+                        min_run_px=self.min_run_px,
+                    )
+                )
+            except ValueError:
+                continue
+
+        if len(spans) < self.min_valid_rows:
+            raise ValueError(
+                f"insufficient valid belt rows: {len(spans)} found, {self.min_valid_rows} required"
+            )
+
+        widths = [span.span_px for span in spans]
+        spread = max(widths) - min(widths)
+        if self.max_span_spread_px is not None and spread > self.max_span_spread_px:
+            raise ValueError(
+                f"belt span is inconsistent across rows: spread={spread}px exceeds {self.max_span_spread_px}px"
+            )
+
+        left = int(round(median(span.left_x for span in spans)))
+        right = int(round(median(span.right_x_exclusive for span in spans)))
+        if right <= left:
+            raise ValueError("aggregated belt span is invalid")
+        if right > frame.width_px:
+            raise ValueError("estimated span exceeds declared frame width")
+
+        return BeltSpan(
+            left_x=left,
+            right_x_exclusive=right,
+            span_px=right - left,
+            row_y=int(round(median(span.row_y for span in spans))),
+            threshold=float(self.threshold),
+            sampled_rows=len(spans),
+            span_spread_px=spread,
+        )
