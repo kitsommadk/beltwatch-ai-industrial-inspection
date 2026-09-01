@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 
-import numpy as np
 import pytest
+
+np = pytest.importorskip("numpy")
+pytest.importorskip("cv2")
 
 from app.camera import FramePacket
 from app.edge_span import MultiRowDarkEstimator
