@@ -10,8 +10,35 @@ from datetime import datetime
 
 from .calibration import CalibrationProfile, PositionProvider
 from .camera import CameraProvider, FramePacket
-from .edge_span import SpanEstimator
+from .edge_span import BeltSpan, SpanEstimator
 from .measurement import WidthMeasurement, WidthTolerance, measure_width_from_span
+
+
+@dataclass(frozen=True)
+class GeometryProvenance:
+    """Traceable image-geometry output used to produce a width measurement."""
+
+    estimator_id: str
+    left_x: int
+    right_x_exclusive: int
+    row_y: int
+    threshold: float
+    sampled_rows: int
+    span_spread_px: int
+
+    @classmethod
+    def from_span(cls, span: BeltSpan, estimator_id: str) -> "GeometryProvenance":
+        if not estimator_id.strip():
+            raise ValueError("estimator_id must not be empty")
+        return cls(
+            estimator_id=estimator_id,
+            left_x=span.left_x,
+            right_x_exclusive=span.right_x_exclusive,
+            row_y=span.row_y,
+            threshold=span.threshold,
+            sampled_rows=span.sampled_rows,
+            span_spread_px=span.span_spread_px,
+        )
 
 
 @dataclass(frozen=True)
@@ -26,6 +53,7 @@ class InspectionEvidence:
     calibration_version: int
     measured_span_px: float
     width: WidthMeasurement
+    geometry: GeometryProvenance | None = None
 
 
 class EvidenceService:
@@ -48,6 +76,7 @@ class EvidenceService:
         target_width_in: float,
         warning_tolerance_in: float,
         fail_tolerance_in: float,
+        geometry: GeometryProvenance | None = None,
     ) -> InspectionEvidence:
         if frame.camera_id != self.calibration.camera_id:
             raise ValueError("camera and calibration profile do not match")
@@ -76,6 +105,7 @@ class EvidenceService:
             calibration_version=self.calibration.version,
             measured_span_px=measured_span_px,
             width=width,
+            geometry=geometry,
         )
 
     def capture_width(
@@ -85,7 +115,10 @@ class EvidenceService:
         warning_tolerance_in: float,
         fail_tolerance_in: float,
     ) -> InspectionEvidence:
-        """Compatibility path where upstream code supplies the measured span."""
+        """Compatibility path where upstream code supplies the measured span.
+
+        Manual/development captures intentionally have no image-geometry provenance.
+        """
         frame = self.camera.capture()
         return self._build_width_evidence(
             frame,
@@ -101,19 +134,28 @@ class EvidenceService:
         target_width_in: float,
         warning_tolerance_in: float,
         fail_tolerance_in: float,
+        *,
+        estimator_id: str | None = None,
     ) -> InspectionEvidence:
         """Capture one image, estimate its belt edges, and create width evidence.
 
-        This removes the caller-supplied pixel span shortcut for replay/live-image
-        providers. The estimator remains replaceable so future segmentation models
-        can be benchmarked against this deterministic baseline.
+        Automatic captures persist the exact left/right geometry and estimator
+        provenance used for the dimensional result. Configured estimators may expose
+        a stable ``provenance_id``; direct/custom estimators fall back to class name.
         """
         frame = self.camera.capture()
         span = estimator.estimate(frame)
+        resolved_estimator_id = (
+            estimator_id
+            or getattr(estimator, "provenance_id", None)
+            or estimator.__class__.__name__
+        )
+        provenance = GeometryProvenance.from_span(span, resolved_estimator_id)
         return self._build_width_evidence(
             frame,
             float(span.span_px),
             target_width_in,
             warning_tolerance_in,
             fail_tolerance_in,
+            geometry=provenance,
         )

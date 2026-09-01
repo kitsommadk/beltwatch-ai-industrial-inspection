@@ -4,10 +4,17 @@ from .database import connect
 from .evidence import InspectionEvidence
 
 
+EVIDENCE_SCHEMA_VERSION = 2
+
+
 def initialize_evidence_store() -> None:
-    """Create the additive evidence table without rewriting existing pilot data."""
+    """Create additive evidence tables and record the evidence-store schema version.
+
+    Version 2 adds a one-to-one geometry-provenance table without rewriting existing
+    dimensional evidence. Existing rows remain valid and simply have no geometry row.
+    """
     with connect() as con:
-        con.execute(
+        con.executescript(
             """
             CREATE TABLE IF NOT EXISTS inspection_evidence (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,12 +34,44 @@ def initialize_evidence_store() -> None:
                 status TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES sessions(id),
                 UNIQUE(session_id, camera_id, frame_sequence)
-            )
+            );
+
+            CREATE TABLE IF NOT EXISTS evidence_schema_metadata (
+                singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+                schema_version INTEGER NOT NULL CHECK(schema_version > 0)
+            );
+
+            CREATE TABLE IF NOT EXISTS inspection_geometry (
+                evidence_id INTEGER PRIMARY KEY,
+                estimator_id TEXT NOT NULL,
+                left_x INTEGER NOT NULL,
+                right_x_exclusive INTEGER NOT NULL,
+                row_y INTEGER NOT NULL,
+                threshold REAL NOT NULL,
+                sampled_rows INTEGER NOT NULL,
+                span_spread_px INTEGER NOT NULL,
+                FOREIGN KEY(evidence_id) REFERENCES inspection_evidence(id) ON DELETE CASCADE,
+                CHECK(right_x_exclusive > left_x),
+                CHECK(sampled_rows > 0),
+                CHECK(span_spread_px >= 0)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_evidence_session_position
+                ON inspection_evidence(session_id, position_ft);
             """
         )
         con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_evidence_session_position ON inspection_evidence(session_id, position_ft)"
+            "INSERT OR IGNORE INTO evidence_schema_metadata(singleton_id, schema_version) VALUES (1, ?)",
+            (EVIDENCE_SCHEMA_VERSION,),
         )
+        stored = con.execute(
+            "SELECT schema_version FROM evidence_schema_metadata WHERE singleton_id=1"
+        ).fetchone()[0]
+        if stored != EVIDENCE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"evidence schema version {stored} does not match application version {EVIDENCE_SCHEMA_VERSION}; "
+                "explicit evidence migration is required"
+            )
 
 
 def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
@@ -63,8 +102,48 @@ def save_evidence(session_id: int, evidence: InspectionEvidence) -> dict:
                 width.status.value,
             ),
         )
-        row = con.execute("SELECT * FROM inspection_evidence WHERE id=?", (cursor.lastrowid,)).fetchone()
+        evidence_id = cursor.lastrowid
+        if evidence.geometry is not None:
+            geometry = evidence.geometry
+            con.execute(
+                """
+                INSERT INTO inspection_geometry(
+                    evidence_id, estimator_id, left_x, right_x_exclusive, row_y,
+                    threshold, sampled_rows, span_spread_px
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    evidence_id,
+                    geometry.estimator_id,
+                    geometry.left_x,
+                    geometry.right_x_exclusive,
+                    geometry.row_y,
+                    geometry.threshold,
+                    geometry.sampled_rows,
+                    geometry.span_spread_px,
+                ),
+            )
+        row = _evidence_row(con, evidence_id)
         return dict(row)
+
+
+def _evidence_row(con, evidence_id: int):
+    return con.execute(
+        """
+        SELECT e.*,
+               g.estimator_id,
+               g.left_x,
+               g.right_x_exclusive,
+               g.row_y AS geometry_row_y,
+               g.threshold AS geometry_threshold,
+               g.sampled_rows,
+               g.span_spread_px
+        FROM inspection_evidence e
+        LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+        WHERE e.id=?
+        """,
+        (evidence_id,),
+    ).fetchone()
 
 
 def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
@@ -72,8 +151,20 @@ def list_evidence(session_id: int, limit: int = 250) -> list[dict]:
         raise ValueError("limit must be between 1 and 1000")
     with connect() as con:
         rows = con.execute(
-            """SELECT * FROM inspection_evidence
-               WHERE session_id=? ORDER BY position_ft DESC, id DESC LIMIT ?""",
+            """
+            SELECT e.*,
+                   g.estimator_id,
+                   g.left_x,
+                   g.right_x_exclusive,
+                   g.row_y AS geometry_row_y,
+                   g.threshold AS geometry_threshold,
+                   g.sampled_rows,
+                   g.span_spread_px
+            FROM inspection_evidence e
+            LEFT JOIN inspection_geometry g ON g.evidence_id=e.id
+            WHERE e.session_id=?
+            ORDER BY e.position_ft DESC, e.id DESC LIMIT ?
+            """,
             (session_id, limit),
         ).fetchall()
         return [dict(row) for row in rows]

@@ -105,11 +105,14 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
             camera = SimulatedCamera(camera_id)
         else:
             camera = ReplayCamera(camera_id, _replay_frames(camera_id), loop=False)
-            estimators[camera_id] = MultiRowDarkEstimator(
+            estimator = MultiRowDarkEstimator(
                 threshold=100,
                 min_run_px=100,
                 max_span_spread_px=12,
             )
+            # Stable evidence provenance label for this configured algorithm contract.
+            estimator.provenance_id = "multirow-dark-v1"
+            estimators[camera_id] = estimator
         services[camera_id] = EvidenceService(camera, position, calibration)
 
     return InspectionRuntime(
