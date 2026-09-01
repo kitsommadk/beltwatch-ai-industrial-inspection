@@ -63,6 +63,9 @@ class FrameQualityError(ValueError):
         super().__init__(f"frame quality {result.status.value}: {detail}")
 
 
+DEFAULT_FRAME_QUALITY_POLICY = FrameQualityPolicy(policy_id="default-frame-quality-v1")
+
+
 def _intensity(pixel: Any) -> float:
     if isinstance(pixel, Number):
         return float(pixel)
