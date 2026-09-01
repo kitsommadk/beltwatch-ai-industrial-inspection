@@ -11,7 +11,14 @@ from .database import connect, initialize
 from .detection import SimulatedDetector
 from .evidence_store import evidence_summary, initialize_evidence_store, list_evidence, save_evidence
 from .runtime import InspectionRuntime, RuntimeConfigurationError, build_runtime
-from .schemas import DetectionRequest, EvidenceCaptureRequest, EventReview, ProgressInput, SessionInput
+from .schemas import (
+    DetectionRequest,
+    EvidenceAutoCaptureRequest,
+    EvidenceCaptureRequest,
+    EventReview,
+    ProgressInput,
+    SessionInput,
+)
 
 
 def now() -> str:
@@ -54,8 +61,8 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="BeltWatch AI Pilot API",
-    description="Local-first inspection workflow API. Detection is simulated in this public portfolio build.",
-    version="0.5.0",
+    description="Local-first inspection workflow API with explicit simulation and replay validation modes.",
+    version="0.6.0",
     lifespan=lifespan,
 )
 
@@ -81,17 +88,40 @@ def health(runtime: InspectionRuntime = Depends(get_runtime)):
     }
 
 
+def _camera_component(runtime: InspectionRuntime, camera_id: str, label: str) -> dict:
+    service = runtime.service_for(camera_id)
+    camera = service.camera
+    health_fn = getattr(camera, "health", None)
+    health = health_fn() if callable(health_fn) else None
+    if runtime.mode == "simulation":
+        status = "simulated"
+    elif runtime.mode == "replay":
+        status = "replay"
+    else:
+        status = "configured"
+    component = {"name": label, "status": status}
+    if health is not None:
+        component["health"] = {
+            "connected": health.connected,
+            "stale": health.stale,
+            "frames_captured": health.frames_captured,
+            "capture_failures": health.capture_failures,
+            "last_frame_at": health.last_frame_at.isoformat() if health.last_frame_at else None,
+        }
+    return component
+
+
 @app.get("/api/system")
 def system_status(runtime: InspectionRuntime = Depends(get_runtime)):
     return {
         "mode": runtime.mode,
         "components": [
-            {"name": "Top camera", "status": "simulated" if runtime.mode == "simulation" else "configured"},
-            {"name": "Bottom camera", "status": "simulated" if runtime.mode == "simulation" else "configured"},
+            _camera_component(runtime, "top", "Top camera"),
+            _camera_component(runtime, "bottom", "Bottom camera"),
             {"name": "Controlled lighting", "status": "ready"},
             {"name": "Edge computer", "status": "healthy"},
             {"name": "Local database", "status": "recording"},
-            {"name": "Storage", "status": "82% free"},
+            {"name": "Storage", "status": "not-measured"},
         ],
     }
 
@@ -165,37 +195,17 @@ def progress_session(payload: ProgressInput):
         return row_dict(current_session(con))
 
 
-@app.post("/api/evidence/capture")
-def capture_evidence(
-    payload: EvidenceCaptureRequest,
-    runtime: InspectionRuntime = Depends(get_runtime),
-):
-    """Capture and persist traceable dimensional evidence for the active session.
-
-    In the public simulation build, measured_span_px is supplied by the caller.
-    A later vision adapter will calculate this value from detected belt edges.
-    """
+def _active_session_measurement_context() -> tuple[int, float, float]:
     with connect() as con:
         session = current_session(con)
         if session is None:
             raise HTTPException(409, "Start an inspection session before capturing evidence")
         if session["status"] != "inspecting":
             raise HTTPException(409, "Inspection evidence can only be captured while the session is inspecting")
-        session_id = session["id"]
-        target_width = session["target_width_in"]
-        warning_tolerance = session["tolerance_in"]
+        return session["id"], session["target_width_in"], session["tolerance_in"]
 
-    try:
-        service = runtime.service_for(payload.camera)
-        evidence = service.capture_width(
-            measured_span_px=payload.measured_span_px,
-            target_width_in=target_width,
-            warning_tolerance_in=warning_tolerance,
-            fail_tolerance_in=warning_tolerance * 2,
-        )
-    except (RuntimeConfigurationError, ValueError) as exc:
-        raise HTTPException(422, str(exc)) from exc
 
+def _persist_captured_evidence(session_id: int, evidence):
     saved = save_evidence(session_id, evidence)
     with connect() as con:
         con.execute(
@@ -208,6 +218,51 @@ def capture_evidence(
             f"evidence={saved['id']} camera={saved['camera_id']} position_ft={saved['position_ft']} status={saved['status']}",
         )
     return saved
+
+
+@app.post("/api/evidence/capture")
+def capture_evidence(
+    payload: EvidenceCaptureRequest,
+    runtime: InspectionRuntime = Depends(get_runtime),
+):
+    """Compatibility path where the caller supplies a measured pixel span."""
+    session_id, target_width, warning_tolerance = _active_session_measurement_context()
+    try:
+        service = runtime.service_for(payload.camera)
+        evidence = service.capture_width(
+            measured_span_px=payload.measured_span_px,
+            target_width_in=target_width,
+            warning_tolerance_in=warning_tolerance,
+            fail_tolerance_in=warning_tolerance * 2,
+        )
+    except (RuntimeConfigurationError, ValueError, RuntimeError, EOFError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _persist_captured_evidence(session_id, evidence)
+
+
+@app.post("/api/evidence/capture-auto")
+def capture_evidence_auto(
+    payload: EvidenceAutoCaptureRequest,
+    runtime: InspectionRuntime = Depends(get_runtime),
+):
+    """Capture an image and derive width from its image geometry automatically.
+
+    Replay mode exercises the same camera -> estimator -> calibration -> evidence
+    boundary intended for future live cameras without claiming physical validation.
+    """
+    session_id, target_width, warning_tolerance = _active_session_measurement_context()
+    try:
+        service = runtime.service_for(payload.camera)
+        estimator = runtime.estimator_for(payload.camera)
+        evidence = service.capture_width_auto(
+            estimator=estimator,
+            target_width_in=target_width,
+            warning_tolerance_in=warning_tolerance,
+            fail_tolerance_in=warning_tolerance * 2,
+        )
+    except (RuntimeConfigurationError, ValueError, RuntimeError, EOFError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return _persist_captured_evidence(session_id, evidence)
 
 
 @app.get("/api/evidence")

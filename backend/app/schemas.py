@@ -31,7 +31,13 @@ class DetectionRequest(BaseModel):
 
 
 class EvidenceCaptureRequest(BaseModel):
-    """Development capture input until a vision adapter supplies detected belt edges."""
+    """Development compatibility input where the caller supplies pixel span."""
 
     camera: Literal["top", "bottom"]
     measured_span_px: float = Field(gt=0, le=20_000)
+
+
+class EvidenceAutoCaptureRequest(BaseModel):
+    """Automatic image-driven capture request for replay/live-image providers."""
+
+    camera: Literal["top", "bottom"]
