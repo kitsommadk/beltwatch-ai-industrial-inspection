@@ -90,7 +90,7 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
             estimator = MultiRowDarkEstimator(threshold=100, min_run_px=100, max_span_spread_px=12)
             estimator.provenance_id = "multirow-dark-v1"
             estimator.quality_policy = GeometryQualityPolicy(
-                policy_id="replay-multirow-quality-v3",
+                policy_id="replay-multirow-quality-v4",
                 high_confidence_min_rows=5,
                 valid_min_rows=3,
                 high_confidence_max_span_spread_px=2,
@@ -99,6 +99,8 @@ def build_runtime(mode: str | None = None) -> InspectionRuntime:
                 valid_max_edge_spread_px=12,
                 high_confidence_min_edge_contrast=80.0,
                 valid_min_edge_contrast=30.0,
+                high_confidence_min_edge_sharpness=80.0,
+                valid_min_edge_sharpness=25.0,
             )
             estimators[camera_id] = estimator
         services[camera_id] = EvidenceService(camera, position, calibration)
