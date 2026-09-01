@@ -11,6 +11,7 @@ from statistics import median
 
 
 class TemporalQualityStatus(str, Enum):
+    INSUFFICIENT_HISTORY = "insufficient-history"
     HIGH_CONFIDENCE = "high-confidence"
     DEGRADED = "degraded"
     INVALID = "invalid"
@@ -58,7 +59,16 @@ class TemporalQualityError(ValueError):
 def assess_temporal_width(current_width_in: float, history_widths_in: tuple[float, ...] | list[float], policy: TemporalQualityPolicy) -> TemporalQualityResult:
     history = tuple(float(value) for value in history_widths_in[-policy.history_size:])
     if not history:
-        return TemporalQualityResult(policy.policy_id, TemporalQualityStatus.HIGH_CONFIDENCE, 0, None, None, None, None, ("no prior trusted measurements; temporal baseline initialized",))
+        return TemporalQualityResult(
+            policy.policy_id,
+            TemporalQualityStatus.INSUFFICIENT_HISTORY,
+            0,
+            None,
+            None,
+            None,
+            None,
+            ("no comparable prior trusted measurements; temporal status is not yet established",),
+        )
 
     previous = history[-1]
     baseline = float(median(history))
@@ -81,4 +91,4 @@ def assess_temporal_width(current_width_in: float, history_widths_in: tuple[floa
     if degraded:
         return TemporalQualityResult(policy.policy_id, TemporalQualityStatus.DEGRADED, len(history), previous, baseline, step, median_deviation, tuple(degraded))
 
-    return TemporalQualityResult(policy.policy_id, TemporalQualityStatus.HIGH_CONFIDENCE, len(history), previous, baseline, step, median_deviation, ("measurement is consistent with recent trusted width history",))
+    return TemporalQualityResult(policy.policy_id, TemporalQualityStatus.HIGH_CONFIDENCE, len(history), previous, baseline, step, median_deviation, ("measurement is consistent with recent comparable trusted width history",))
